@@ -70,7 +70,7 @@ ENV VIRTUAL_ENV=/venv
 ENV PATH=/venv/bin:$PATH
 VOLUME ["/app", "/config", "/data", "/venv"]
 WORKDIR /app
-CMD ['python', '-m', 'app']
+CMD ["python3", "-m", "app"]
 """
 
 NODEJS_DOCKERFILE = """
@@ -89,12 +89,46 @@ ENV NPM_CONFIG_PREFIX=/venv
 ENV PATH=/venv/bin:/venv/.bin:$PATH
 VOLUME ["/app", "/config", "/data", "/venv"]
 WORKDIR /app
-CMD ['node', 'app.js']
+CMD ["node", "app.js"]
+"""
+
+PHP_DOCKERFILE = """
+FROM debian:trixie-slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt update \
+ && apt dist-upgrade -y \
+ && apt-get -qq install \
+    git \
+    openssh-client \
+    php-cli \
+    php-curl \
+    php-mbstring \
+    php-xml \
+    php-zip \
+    composer
+VOLUME ["/app", "/config", "/data", "/venv"]
+WORKDIR /app
+CMD ["php", "-S", "0.0.0.0:8000", "-t", "/app"]
+"""
+
+BUN_DOCKERFILE = """
+FROM oven/bun:1-alpine
+RUN apk add --no-cache \
+    git \
+    openssh-client
+ENV NODE_PATH=/venv
+ENV BUN_INSTALL=/venv
+ENV PATH=/venv/bin:$PATH
+VOLUME ["/app", "/config", "/data", "/venv"]
+WORKDIR /app
+CMD ["bun", "run", "index.js"]
 """
 
 RUNTIME_IMAGES = {
     'kata/python': PYTHON_DOCKERFILE,
-    'kata/nodejs': NODEJS_DOCKERFILE
+    'kata/nodejs': NODEJS_DOCKERFILE,
+    'kata/php': PHP_DOCKERFILE,
+    'kata/bun': BUN_DOCKERFILE
 }
 
 # === Utility functions ===
@@ -210,13 +244,23 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
             'nodejs': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
                        ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
                        ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/config']]
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
+            'php': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
+            'bun': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/config']]
         }
     else:
         cmds = {
             'python': [['python3', '-m', 'venv', '/venv'],
                        ['pip3', 'install', '-r', '/app/requirements.txt']],
-            'nodejs': [['npm', 'install' ]]
+            'nodejs': [['npm', 'install' ]],
+            'php': [['composer', 'install', '--no-dev', '--optimize-autoloader']],
+            'bun': [['bun', 'install']]
         }
     for cmd in cmds[runtime]:
         echo(f"Running cleanup command: {' '.join(cmd)}", fg='green')
