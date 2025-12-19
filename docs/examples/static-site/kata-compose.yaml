@@ -1,11 +1,22 @@
-# Static site example for Kata
-# - Serves files from ./public using BusyBox httpd
-# - Traefik labels are generated automatically; host defaults to <app>.localhost
+# Static site example (HTTP-only, multiple hostnames)
+# - Serves files directly from /app (mount your site there); no /public subfolder needed
+# - Uses BusyBox httpd via the built-in `static` runtime
+# - Declares Traefik config to force HTTP-only on the given hostnames and avoid the default TLS router
+# - Includes an extra router example for multiple hosts using OR rules
 
 environment:
   PORT: "8000"
-  DOCROOT: "/app/public"
+  DOCROOT: "/app"
   HOSTS: "site.localhost,alias.localhost"
+
+traefik:
+  host: "site.localhost,alias.localhost"
+  port: 8000
+  service: site
+  entrypoints: ["web"]
+  tls: false
+  enable_http_redirect: false
+  inject_service: true
 
 services:
   site:
@@ -16,7 +27,8 @@ services:
       PORT: "${PORT}"
       DOCROOT: "${DOCROOT}"
     labels:
-      traefik.http.routers.site-alt.rule: "Host(`site.localhost`,`alias.localhost`)"
-      traefik.http.routers.site-alt.entrypoints: "websecure"
+      # Extra router example showing multiple hosts with OR rules (required by Traefik v3)
+      traefik.http.routers.site-alt.rule: "Host(`site.localhost`) || Host(`alias.localhost`)"
+      traefik.http.routers.site-alt.entrypoints: "web"
       traefik.http.routers.site-alt.service: "site-alt"
       traefik.http.services.site-alt.loadbalancer.server.port: "${PORT}"
