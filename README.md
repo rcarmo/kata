@@ -56,10 +56,6 @@ services:
       traefik.http.services.web.loadbalancer.server.port: "5000"
 ```
 
-    ### Migration from Caddy
-
-    Kata no longer applies `caddy:` blocks. A top-level `caddy:` key now triggers a hard error; remove it and rely on the implicit Traefik labels instead. Ensure the external network `traefik-proxy` and volume `traefik-acme` exist (Kata will create them if absent) and switch any host rules to Traefik label syntax. Use `kata config:traefik <app> --json` to validate what will be applied.
-
 ### Inspecting Traefik config
 
 - `kata config:traefik <app> [--json]` — render generated labels and router/service rules
