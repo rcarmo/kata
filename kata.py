@@ -147,33 +147,32 @@ RUNTIME_IMAGES = {
 
 def traefik_is_running() -> bool:
     """Return True if a Traefik container or service appears to be running."""
-    # Check swarm services first to cover stack deployments
-    try:
-        services = check_output(['docker', 'service', 'ls', '--format', '{{.Name}} {{.Image}}'], universal_newlines=True)
-        for line in services.splitlines():
-            parts = line.lower().split()
-            if not parts:
-                continue
-            name = parts[0]
-            image = parts[1] if len(parts) > 1 else ''
-            if 'traefik' in name or 'traefik' in image:
-                return True
-    except Exception:
-        pass
-
-    # Fallback to regular containers (compose or standalone)
+    # Check regular containers (compose or standalone) first
     try:
         containers = check_output(['docker', 'ps', '--format', '{{.Names}} {{.Image}}'], universal_newlines=True)
         for line in containers.splitlines():
             parts = line.lower().split()
             if not parts:
                 continue
-            name = parts[0]
             image = parts[1] if len(parts) > 1 else ''
-            if 'traefik' in name or 'traefik' in image:
+            if 'traefik' in image:
                 return True
     except Exception:
         pass
+
+    # Check swarm services if this node is a manager
+    if docker_is_swarm_manager():
+        try:
+            services = check_output(['docker', 'service', 'ls', '--format', '{{.Name}} {{.Image}}'], universal_newlines=True, stderr=STDOUT)
+            for line in services.splitlines():
+                parts = line.lower().split()
+                if not parts:
+                    continue
+                image = parts[1] if len(parts) > 1 else ''
+                if 'traefik' in image:
+                    return True
+        except Exception:
+            pass
 
     return False
 
