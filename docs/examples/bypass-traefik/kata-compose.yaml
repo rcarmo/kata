@@ -1,0 +1,21 @@
+# Static site without Traefik (direct host exposure)
+# - Serves files directly from /app (mount your site there; ensure /app/index.html exists)
+# - Uses BusyBox httpd via the built-in `static` runtime
+# - Publishes a host port instead of relying on Traefik; good for local or isolated use
+
+environment:
+  PORT: "8000"
+  DOCROOT: "/app"
+
+traefik: {}  # disable Traefik injection entirely
+
+services:
+  site:
+    runtime: static
+    environment:
+      PORT: "${PORT}"
+      DOCROOT: "${DOCROOT}"
+    ports:
+      - "8000:8000"   # change the left side if you need a different host port
+    # If you prefer host networking instead of a published port, use the line below instead of ports:
+    # network_mode: host
