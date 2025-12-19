@@ -1314,9 +1314,10 @@ def cmd_runtime_clean():
 @option('--bind', 'dash_bind', default='127.0.0.1', show_default=True, help='Bind address for the dashboard (use 0.0.0.0 to expose externally).')
 @option('--web', 'web_bind', default='80:80', show_default=True, help='Host bind for HTTP entrypoint (host:container). Set empty to skip binding.')
 @option('--websecure', 'websecure_bind', default='443:443', show_default=True, help='Host bind for HTTPS entrypoint (host:container). Set empty to skip binding.')
+@option('--off', is_flag=True, default=False, help='Disable the dashboard (recreate container without dashboard entrypoint).')
 @option('--replace/--no-replace', default=True, show_default=True, help='Replace existing kata-traefik container if present.')
-def cmd_traefik_dashboard(dash_port, dash_bind, web_bind, websecure_bind, replace):
-    """Restart shared Traefik with the dashboard enabled."""
+def cmd_traefik_dashboard(dash_port, dash_bind, web_bind, websecure_bind, off, replace):
+    """Restart shared Traefik with the dashboard enabled or disable it with --off."""
     network_name = 'traefik-proxy'
     volume_name = 'traefik-acme'
 
@@ -1332,14 +1333,17 @@ def cmd_traefik_dashboard(dash_port, dash_bind, web_bind, websecure_bind, replac
             echo(f"Warning: could not remove existing kata-traefik: {exc}", fg='yellow')
 
     run_shared_traefik(
-        enable_dashboard=True,
+        enable_dashboard=not off,
         dashboard_bind=dash_bind,
         dashboard_port=dash_port,
         web_bind=web_bind,
         websecure_bind=websecure_bind
     )
-    target = 'localhost' if dash_bind == '127.0.0.1' else dash_bind
-    echo(f"Traefik dashboard enabled at http://{target}:{dash_port}/dashboard/", fg='green')
+    if off:
+        echo("Traefik dashboard disabled (container restarted without dashboard)", fg='green')
+    else:
+        target = 'localhost' if dash_bind == '127.0.0.1' else dash_bind
+        echo(f"Traefik dashboard enabled at http://{target}:{dash_port}/dashboard/", fg='green')
 
 
 @command('rm')
