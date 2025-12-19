@@ -619,16 +619,23 @@ def docker_create_runtime_image(image_name, dockerfile_content):
         remove(dockerfile_path)
 
 
+def docker_remove_image(image_name: str, warn: bool = True) -> bool:
+    """Remove a Docker image; return True on success, False on failure."""
+    try:
+        call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True)
+        return True
+    except Exception as exc:
+        if warn:
+            echo(f"Warning: could not remove {image_name}: {exc}", fg='yellow')
+        return False
+
+
 def docker_rebuild_all_runtimes() -> bool:
     """Force rebuild of all built-in runtime images."""
     all_ok = True
     for image_name, dockerfile_content in RUNTIME_IMAGES.items():
         echo(f"-----> Rebuilding {image_name}", fg='yellow')
-        try:
-            call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True)
-        except Exception:
-            # proceed even if removal fails (image may not exist)
-            pass
+        docker_remove_image(image_name, warn=False)
         if not docker_create_runtime_image(image_name, dockerfile_content):
             all_ok = False
     return all_ok
@@ -642,10 +649,7 @@ def docker_rebuild_runtime(runtime: str) -> bool:
         echo(f"Error: unknown runtime '{runtime}'. Valid: {', '.join([i.split('/',1)[1] for i in RUNTIME_IMAGES.keys()])}", fg='red')
         return False
     echo(f"-----> Rebuilding {image_name}", fg='yellow')
-    try:
-        call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True)
-    except Exception:
-        pass
+    docker_remove_image(image_name, warn=False)
     return docker_create_runtime_image(image_name, dockerfile_content)
 
 
@@ -653,10 +657,7 @@ def docker_remove_runtime_images() -> None:
     """Remove all built-in runtime images (kata/*)."""
     for image_name in RUNTIME_IMAGES.keys():
         echo(f"-----> Removing {image_name}", fg='yellow')
-        try:
-            call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True)
-        except Exception as exc:
-            echo(f"Warning: could not remove {image_name}: {exc}", fg='yellow')
+        docker_remove_image(image_name, warn=True)
 
 
 def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None):
