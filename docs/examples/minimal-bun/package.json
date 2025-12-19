@@ -1,0 +1,10 @@
+{
+  "name": "kata-minimal-bun",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts"
+  },
+  "dependencies": {}
+}

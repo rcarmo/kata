@@ -1,0 +1,9 @@
+{
+  "name": "kata/minimal-php",
+  "description": "Minimal PHP example for Kata runtime",
+  "require": {},
+  "config": {
+    "optimize-autoloader": true,
+    "sort-packages": true
+  }
+}

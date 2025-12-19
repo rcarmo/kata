@@ -1,0 +1,14 @@
+# Minimal PHP example for Kata
+# - Serves a tiny PHP endpoint via the built-in server
+# - Traefik labels are generated automatically; host defaults to <app>.localhost
+
+environment:
+  PORT: "8000"
+  DOCROOT: "/app/public"
+
+services:
+  web:
+    runtime: php
+    command: php -S 0.0.0.0:${PORT} -t ${DOCROOT}
+    expose:
+      - "${PORT}"

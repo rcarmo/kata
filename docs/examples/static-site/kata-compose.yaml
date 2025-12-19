@@ -1,0 +1,22 @@
+# Static site example for Kata
+# - Serves files from ./public using BusyBox httpd
+# - Traefik labels are generated automatically; host defaults to <app>.localhost
+
+environment:
+  PORT: "8000"
+  DOCROOT: "/app/public"
+  HOSTS: "site.localhost,alias.localhost"
+
+services:
+  site:
+    runtime: static
+    expose:
+      - "${PORT}"
+    environment:
+      PORT: "${PORT}"
+      DOCROOT: "${DOCROOT}"
+    labels:
+      traefik.http.routers.site-alt.rule: "Host(`site.localhost`,`alias.localhost`)"
+      traefik.http.routers.site-alt.entrypoints: "websecure"
+      traefik.http.routers.site-alt.service: "site-alt"
+      traefik.http.services.site-alt.loadbalancer.server.port: "${PORT}"

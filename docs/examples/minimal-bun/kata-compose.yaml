@@ -1,5 +1,5 @@
-# Minimal Python example for Kata
-# - Runs a FastAPI app with Uvicorn
+# Minimal Bun example for Kata
+# - Serves a tiny JSON endpoint via Bun
 # - Traefik labels are generated automatically; host defaults to <app>.localhost
 
 environment:
@@ -7,7 +7,7 @@ environment:
 
 services:
   web:
-    runtime: python
-    command: uvicorn app:app --host 0.0.0.0 --port ${PORT}
+    runtime: bun
+    command: bun run index.ts
     expose:
       - "${PORT}"

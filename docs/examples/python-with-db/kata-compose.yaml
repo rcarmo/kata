@@ -1,0 +1,50 @@
+# Python + Postgres example
+# - Web service is reachable via Traefik (traefik-proxy network)
+# - Database is only on an internal network
+
+networks:
+  internal:
+  traefik-proxy:
+    external: true
+
+environment:
+  PORT: "8000"
+  DB_HOST: "db"
+  DB_PORT: "5432"
+  DB_USER: "appuser"
+  DB_PASSWORD: "apppass"
+  DB_NAME: "appdb"
+
+services:
+  web:
+    runtime: python
+    command: uvicorn app:app --host 0.0.0.0 --port ${PORT}
+    expose:
+      - "${PORT}"
+    environment:
+      PORT: "${PORT}"
+      DB_HOST: "${DB_HOST}"
+      DB_PORT: "${DB_PORT}"
+      DB_USER: "${DB_USER}"
+      DB_PASSWORD: "${DB_PASSWORD}"
+      DB_NAME: "${DB_NAME}"
+    depends_on:
+      - db
+    networks:
+      - internal
+      - traefik-proxy
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: "${DB_USER}"
+      POSTGRES_PASSWORD: "${DB_PASSWORD}"
+      POSTGRES_DB: "${DB_NAME}"
+    volumes:
+      - data:/var/lib/postgresql/data
+    networks:
+      - internal
+
+volumes:
+  # Reuse Kata's app data bind-mount so Postgres data lives under DATA_ROOT/<app>
+  data:

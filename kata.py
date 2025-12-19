@@ -8,17 +8,18 @@ try:
 except AssertionError:
     exit("Kata requires Python 3.12 or above")
 
-from http.client import HTTPConnection, HTTPSConnection
-from json import dumps, loads
+from http.client import HTTPSConnection
+from json import dumps
 from os import chmod, environ, getgid, getuid, listdir, makedirs, remove, stat
 from os.path import abspath, dirname, exists, join, realpath
 from re import sub
 from shutil import copyfile, rmtree, which
 from stat import S_IRUSR, S_IWUSR, S_IXUSR
 from subprocess import STDOUT, call, check_output, run
-from sys import argv, stderr, stdin, stdout, version_info
+from sys import argv, stderr, stdin, stdout
 from tempfile import NamedTemporaryFile
 from traceback import format_exc
+from urllib.parse import urlparse
 
 from click import UNPROCESSED, argument
 from click import echo as click_echo
@@ -49,6 +50,7 @@ PGID = getgid()
 DOCKER_COMPOSE = ".docker-compose.yaml"
 KATA_COMPOSE = "kata-compose.yaml"
 KATA_MODE_FILE = ".kata-mode"  # stores 'swarm' or 'compose' per app
+TRAEFIK_IMAGE = "traefik:v3.6.5"
 ROOT_FOLDERS = ['APP_ROOT', 'DATA_ROOT', 'ENV_ROOT', 'CONFIG_ROOT', 'GIT_ROOT', 'LOG_ROOT']
 if KATA_BIN not in environ['PATH']:
     environ['PATH'] = KATA_BIN + ":" + environ['PATH']
@@ -124,12 +126,307 @@ WORKDIR /app
 CMD ["bun", "run", "index.js"]
 """
 
+STATIC_DOCKERFILE = """
+FROM busybox:stable-musl
+ENV PORT=8000
+ENV DOCROOT=/app
+EXPOSE 8000
+VOLUME ["/app"]
+WORKDIR /app
+CMD ["sh", "-c", "httpd -f -p ${PORT} -h ${DOCROOT}"]
+"""
+
 RUNTIME_IMAGES = {
     'kata/python': PYTHON_DOCKERFILE,
     'kata/nodejs': NODEJS_DOCKERFILE,
     'kata/php': PHP_DOCKERFILE,
-    'kata/bun': BUN_DOCKERFILE
+    'kata/bun': BUN_DOCKERFILE,
+    'kata/static': STATIC_DOCKERFILE
 }
+
+
+def traefik_is_running() -> bool:
+    """Return True if a Traefik container or service appears to be running."""
+    # Check swarm services first to cover stack deployments
+    try:
+        services = check_output(['docker', 'service', 'ls', '--format', '{{.Name}} {{.Image}}'], universal_newlines=True)
+        for line in services.splitlines():
+            parts = line.lower().split()
+            if not parts:
+                continue
+            name = parts[0]
+            image = parts[1] if len(parts) > 1 else ''
+            if 'traefik' in name or 'traefik' in image:
+                return True
+    except Exception:
+        pass
+
+    # Fallback to regular containers (compose or standalone)
+    try:
+        containers = check_output(['docker', 'ps', '--format', '{{.Names}} {{.Image}}'], universal_newlines=True)
+        for line in containers.splitlines():
+            parts = line.lower().split()
+            if not parts:
+                continue
+            name = parts[0]
+            image = parts[1] if len(parts) > 1 else ''
+            if 'traefik' in name or 'traefik' in image:
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def ensure_shared_traefik() -> None:
+    """Ensure a single shared Traefik is running on this host.
+
+    Creates the external network/volume if missing, tries to start an existing
+    container named 'kata-traefik' if present, and launches a fresh instance if
+    nothing is running. This keeps one ACME store and one set of entrypoints
+    for all stacks.
+    """
+
+    network_name = 'traefik-proxy'
+    volume_name = 'traefik-acme'
+    acme_email = environ.get('KATA_ACME_EMAIL', 'admin@example.com')
+
+    # Ensure shared network/volume exist
+    try:
+        call(['docker', 'network', 'create', network_name], stdout=stdout, stderr=stderr, universal_newlines=True)
+    except Exception:
+        pass
+    try:
+        call(['docker', 'volume', 'create', volume_name], stdout=stdout, stderr=stderr, universal_newlines=True)
+    except Exception:
+        pass
+
+    # If any traefik is running, reuse it
+    if traefik_is_running():
+        return
+
+    # Attempt to start a stopped shared container if it exists
+    try:
+        status = check_output(['docker', 'inspect', '-f', '{{.State.Status}}', 'kata-traefik'], stderr=STDOUT, universal_newlines=True).strip().lower()
+        if status != 'running':
+            call(['docker', 'start', 'kata-traefik'], stdout=stdout, stderr=stderr, universal_newlines=True)
+            if traefik_is_running():
+                return
+        else:
+            return
+    except Exception:
+        pass
+
+    echo("-----> Starting shared Traefik router 'kata-traefik'", fg='yellow')
+    cmd = [
+        'docker', 'run', '-d', '--name', 'kata-traefik', '--restart', 'unless-stopped',
+        '--network', network_name,
+        '-p', '80:80', '-p', '443:443',
+        '-v', '/var/run/docker.sock:/var/run/docker.sock:ro',
+        '-v', f'{volume_name}:/etc/traefik',
+        TRAEFIK_IMAGE,
+        '--providers.docker=true',
+        '--providers.docker.exposedbydefault=false',
+        '--entrypoints.web.address=:80',
+        '--entrypoints.websecure.address=:443',
+        f'--certificatesresolvers.default.acme.email={acme_email}',
+        '--certificatesresolvers.default.acme.storage=/etc/traefik/acme.json',
+        '--certificatesresolvers.default.acme.httpchallenge.entrypoint=web'
+    ]
+    call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
+
+
+def build_default_traefik_cfg(app_name: str, services: dict) -> dict:
+    """Synthesize a default Traefik config when none is provided explicitly."""
+    if not services:
+        return {}
+
+    # Pick the first declared service
+    service_name = next(iter(services.keys()))
+    service = services[service_name] or {}
+
+    # Heuristic: grab the first exposed container port (rightmost segment of a port mapping)
+    port = 8000
+    ports = service.get('ports') if isinstance(service, dict) else None
+    if isinstance(ports, list) and ports:
+        for p in ports:
+            if isinstance(p, str) and p:
+                try:
+                    port = int(str(p).split(':')[-1].split('/')[0])
+                    break
+                except Exception:
+                    continue
+
+    return {
+        'host': f"{app_name}.localhost",
+        'port': port,
+        'service': service_name,
+        'entrypoints': ['websecure'],
+        'inject_service': True,
+    }
+
+
+def apply_traefik(app_name, compose_def, traefik_cfg):
+    """Inject traefik service + labels based on a simplified traefik config block.
+
+    traefik_cfg expected keys:
+      host: required hostname
+      port: upstream service port (int/str)
+      service: target service name (defaults to first service)
+      entrypoints: list[str] (default ["websecure"])
+      enable_http_redirect: bool (default False)
+      acme_email: str (default "admin@example.com")
+      certresolver: str (default "default")
+    """
+    if not traefik_cfg or not isinstance(traefik_cfg, dict):
+        return
+
+    services = compose_def.get('services', {})
+    if not services:
+        echo("Warning: no services defined; skipping traefik label generation", fg='yellow')
+        return
+
+    host = str(traefik_cfg.get('host', '')).strip()
+    if not host:
+        echo("Warning: 'traefik.host' missing; skipping traefik labels", fg='yellow')
+        return
+
+    service_name = traefik_cfg.get('service')
+    if not service_name:
+        # pick first declared service
+        service_name = next(iter(services.keys()))
+    if service_name not in services:
+        echo(f"Warning: traefik.service '{service_name}' not found; skipping traefik labels", fg='yellow')
+        return
+
+    port = traefik_cfg.get('port', None)
+    if port is None:
+        echo("Warning: 'traefik.port' missing; defaulting to 8000", fg='yellow')
+        port = 8000
+
+    entrypoints = traefik_cfg.get('entrypoints', ['websecure'])
+    if isinstance(entrypoints, str):
+        entrypoints = [entrypoints]
+    entrypoints = [str(e) for e in entrypoints if e]
+    if not entrypoints:
+        entrypoints = ['websecure']
+
+    certresolver = traefik_cfg.get('certresolver', 'default')
+    enable_redirect = bool(traefik_cfg.get('enable_http_redirect', False))
+    acme_email = traefik_cfg.get('acme_email', 'admin@example.com')
+    inject_service = bool(traefik_cfg.get('inject_service', True))
+    acme_volume_external = bool(traefik_cfg.get('acme_volume_external', True))
+
+    target_service = services[service_name]
+
+    # Shared traefik network/volume (external) so one Traefik can front multiple stacks
+    network_name = traefik_cfg.get('network', 'traefik-proxy')
+    volume_name = traefik_cfg.get('acme_volume', 'traefik-acme')
+
+    # Normalize labels container form (dict) for compose; stack deploy will map deploy.labels separately if needed.
+    labels = target_service.get('labels')
+    if labels is None:
+        labels = {}
+    elif isinstance(labels, list):
+        # convert list ['k=v'] into dict
+        converted = {}
+        for item in labels:
+            if '=' in item:
+                k, v = item.split('=', 1)
+                converted[k] = v
+        labels = converted
+    elif not isinstance(labels, dict):
+        labels = {}
+
+    router_name = app_name
+    service_key = app_name
+
+    labels[f"traefik.enable"] = "true"
+    labels[f"traefik.http.routers.{router_name}.rule"] = f"Host(`{host}`)"
+    labels[f"traefik.http.routers.{router_name}.entrypoints"] = ",".join(entrypoints)
+    labels[f"traefik.http.routers.{router_name}.service"] = service_key
+    labels[f"traefik.http.services.{service_key}.loadbalancer.server.port"] = str(port)
+    labels[f"traefik.http.routers.{router_name}.tls"] = "true"
+    labels[f"traefik.http.routers.{router_name}.tls.certresolver"] = certresolver
+
+    if enable_redirect:
+        # add middleware to redirect web -> websecure
+        labels[f"traefik.http.routers.{router_name}.entrypoints"] = "websecure"
+        labels[f"traefik.http.middlewares.{router_name}-redirect.redirectscheme.scheme"] = "https"
+        labels[f"traefik.http.middlewares.{router_name}-redirect.redirectscheme.permanent"] = "true"
+        labels[f"traefik.http.routers.{router_name}.middlewares"] = f"{router_name}-redirect"
+
+    target_service['labels'] = labels
+    deploy = target_service.get('deploy', {}) if isinstance(target_service.get('deploy'), dict) else {}
+    deploy_labels = deploy.get('labels')
+    if deploy_labels is None:
+        deploy_labels = {}
+    elif isinstance(deploy_labels, list):
+        converted = {}
+        for item in deploy_labels:
+            if '=' in item:
+                k, v = item.split('=', 1)
+                converted[k] = v
+        deploy_labels = converted
+    elif not isinstance(deploy_labels, dict):
+        deploy_labels = {}
+    # mirror labels into deploy.labels for swarm compatibility
+    for k, v in labels.items():
+        deploy_labels[k] = v
+    deploy['labels'] = deploy_labels
+    target_service['deploy'] = deploy
+
+    # Attach to shared network
+    svc_networks = target_service.get('networks')
+    if svc_networks is None:
+        svc_networks = []
+    if isinstance(svc_networks, str):
+        svc_networks = [svc_networks]
+    if network_name not in svc_networks:
+        svc_networks.append(network_name)
+    target_service['networks'] = svc_networks
+
+    # Declare shared network as external
+    networks = compose_def.get('networks', {})
+    if 'networks' not in compose_def:
+        compose_def['networks'] = networks
+    networks.setdefault(network_name, {'external': True})
+
+    # Declare shared ACME volume as external
+    volumes = compose_def.get('volumes', {})
+    if 'volumes' not in compose_def:
+        compose_def['volumes'] = volumes
+
+    # Declare ACME volume (external by default so a single Traefik can own it)
+    volumes.setdefault(volume_name, {'external': acme_volume_external})
+
+    # Optionally inject a Traefik service (singleton per host via runtime detection)
+    if inject_service:
+        if traefik_is_running():
+            echo("-----> Detected running Traefik; reusing external network/volume", fg='yellow')
+        else:
+            if 'traefik' in services:
+                echo("Warning: traefik service already present in compose; skipping auto-injection", fg='yellow')
+            else:
+                services['traefik'] = {
+                    'image': TRAEFIK_IMAGE,
+                    'command': [
+                        '--providers.docker=true',
+                        '--providers.docker.exposedbydefault=false',
+                        '--entrypoints.web.address=:80',
+                        '--entrypoints.websecure.address=:443',
+                        '--certificatesresolvers.default.acme.email=' + acme_email,
+                        '--certificatesresolvers.default.acme.storage=/etc/traefik/acme.json',
+                        '--certificatesresolvers.default.acme.httpchallenge.entrypoint=web'
+                    ],
+                    'ports': ['80:80', '443:443'],
+                    'volumes': [
+                        '/var/run/docker.sock:/var/run/docker.sock:ro',
+                        f'{volume_name}:/etc/traefik'
+                    ],
+                    'networks': [network_name],
+                    'restart': 'unless-stopped'
+                }
 
 # === Utility functions ===
 
@@ -237,35 +534,37 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
     ]
     if destroy:
         cmds = {
-            'python': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
+            'python': [['chown', '-hR', f'{PUID}:{PGID}', '/data'],
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/app'],
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/venv'],
                        ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
-            'nodejs': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
-                       ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
+            'nodejs': [['chown', '-hR', f'{PUID}:{PGID}', '/data'],
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/app'],
+                       ['chown', '-hR', f'{PUID}:{PGID}', '/venv'],
                        ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
-            'php': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
-                    ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
-                    ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
+            'php': [['chown', '-hR', f'{PUID}:{PGID}', '/data'],
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/app'],
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/venv'],
                     ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
-            'bun': [['chown', '-hR', f'{PUID}:{PGID}', '/data'], 
-                    ['chown', '-hR', f'{PUID}:{PGID}', '/app'], 
-                    ['chown', '-hR', f'{PUID}:{PGID}', '/venv'], 
-                    ['chown', '-hR', f'{PUID}:{PGID}', '/config']]
+            'bun': [['chown', '-hR', f'{PUID}:{PGID}', '/data'],
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/app'],
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/venv'],
+                    ['chown', '-hR', f'{PUID}:{PGID}', '/config']],
+            'static': []
         }
     else:
         cmds = {
             'python': [['python3', '-m', 'venv', '/venv'],
                        ['pip3', 'install', '-r', '/app/requirements.txt']],
-            'nodejs': [['npm', 'install' ]],
+            'nodejs': [['npm', 'install']],
             'php': [['composer', 'install', '--no-dev', '--optimize-autoloader']],
-            'bun': [['bun', 'install']]
+            'bun': [['bun', 'install']],
+            'static': []
         }
-    for cmd in cmds[runtime]:
+    for cmd in cmds.get(runtime, []):
         echo(f"Running cleanup command: {' '.join(cmd)}", fg='green')
         call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
-         cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
+             cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 # === App Management ===
 
@@ -294,6 +593,10 @@ def parse_compose(app_name, filename) -> tuple:
     if not data:
         return None, None
 
+    if data and 'caddy' in data:
+        echo("Error: 'caddy:' is no longer supported. Use Traefik labels (implicit) instead.", fg='red')
+        exit(1)
+
     env = {}
     if "environment" in data:
         env = {k: str(v) for k, v in data["environment"].items()}
@@ -306,7 +609,19 @@ def parse_compose(app_name, filename) -> tuple:
     services = data.get("services", {})
 
     for service_name, service in services.items():
+        is_static = bool(service.pop('static', False)) if isinstance(service, dict) else False
         echo(f"-----> Preparing service '{service_name}'", fg='green')
+        if is_static:
+            service["image"] = "kata/static"
+            service.setdefault("environment", {})
+            # Let env normalization handle list/dict forms; defaults preserve existing
+            if isinstance(service["environment"], dict):
+                service["environment"].setdefault("PORT", "8000")
+                service["environment"].setdefault("DOCROOT", "/app")
+            # Ensure Traefik can reach the container without host port publishing
+            if "ports" not in service and "expose" not in service:
+                service["expose"] = ["8000"]
+
         if not "image" in service:
             if "runtime" in service:
                 service["image"] = f"kata/{service['runtime']}"
@@ -322,10 +637,10 @@ def parse_compose(app_name, filename) -> tuple:
             else:
                 echo(f"Warning: service '{service_name}' has custom volumes, ensure they are correct", fg='yellow')
         if not "command" in service:
-            echo(f"Warning: service '{service_name}' has no 'command' specified", fg='yellow')
-            continue
-        if not "ports" in service:
-            echo(f"Warning: service '{service_name}' has no 'ports' specified", fg='yellow')
+            if not is_static:
+                echo(f"Warning: service '{service_name}' has no 'command' specified", fg='yellow')
+                continue
+        # No auto-expose: users must set ports/expose explicitly for reachable services.
         # Normalize and merge environment
         if "environment" not in service:
             service["environment"] = {}
@@ -352,12 +667,13 @@ def parse_compose(app_name, filename) -> tuple:
             if k not in service["environment"]:
                 service["environment"][k] = str(v)
 
-    caddy_config = {}
-    if "caddy" in data.keys():
-        caddy_config = data.get("caddy", {})
-        del data["caddy"]
+    traefik_config = {}
+    if "traefik" in data.keys():
+        traefik_config = data.get("traefik", {}) or {}
+        del data["traefik"]
     else:
-        echo(f"Warning: no 'caddy' section found, no HTTP/S handling done.", fg='yellow')
+        # Implicit Traefik: synthesize a sensible default using the first service and its port
+        traefik_config = build_default_traefik_cfg(app_name, services)
 
     if not "volumes" in data.keys():
         volumes = {
@@ -382,7 +698,10 @@ def parse_compose(app_name, filename) -> tuple:
     
     if "environment" in data:
         del data['environment']
-    return (data, caddy_config)
+
+    # Apply Traefik labels and inject Traefik service if configured
+    apply_traefik(app_name, data, traefik_config)
+    return (data, traefik_config)
 
 # === Orchestrator helpers ===
 
@@ -449,153 +768,6 @@ def require_swarm_or_warn() -> bool:
         return False
     return True
 
-# Caddy API Management
-
-def validate_caddy_json(config):
-    if not isinstance(config, dict):
-        return False, "Configuration must be a JSON object"
-    if 'listen' in config and not isinstance(config['listen'], list):
-        return False, "'listen' must be an array of strings"
-
-    if 'routes' in config and not isinstance(config['routes'], list):
-        return False, "'routes' must be an array of route objects"
-    # Check for common missing fields
-    if 'routes' not in config and 'handle' not in config:
-        return False, "Missing required 'routes' or 'handle' field"
-    # Check for common handler errors
-    if 'handle' in config and isinstance(config['handle'], list):
-        for handler in config['handle']:
-            if not isinstance(handler, dict):
-                return False, "Each handler must be an object"
-            if 'handler' not in handler:
-                return False, "Each handler must have a 'handler' field"
-    return True, None
-
-
-def caddy_config(app, config_json):
-    """Configure Caddy for an app using the admin API"""
-
-    is_valid, error_message = validate_caddy_json(config_json)
-    if not is_valid:
-        echo(f"Error in caddy configuration: {error_message}", fg='red')
-        return False
-    try:
-        config_data = dumps(config_json).encode('utf-8')
-        echo(f"-----> Configuring Caddy for app '{app}'", fg='green')
-        # First, get the current complete Caddy configuration
-        try:
-            c = HTTPConnection('localhost', 2019, timeout=1)
-            c.request('GET', '/config/')
-            get_resp = c.getresponse()
-            current_config = loads(get_resp.read().decode('utf-8'))
-            c.close()
-
-            # Ensure the structure exists
-            if 'apps' not in current_config:
-                current_config['apps'] = {}
-            if 'http' not in current_config['apps']:
-                current_config['apps']['http'] = {}
-            if 'servers' not in current_config['apps']['http']:
-                current_config['apps']['http']['servers'] = {}
-
-            # Update only our app's configuration, preserving everything else
-            current_config['apps']['http']['servers'][app] = config_json
-
-            # Convert to JSON and encode
-            config_data = dumps(current_config).encode('utf-8')
-
-            # Update the full config
-            c = HTTPConnection('localhost', 2019, timeout=1)
-            c.request('POST', '/load', body=config_data, headers={'Content-Type': 'application/json'})
-            resp = c.getresponse()
-            body = resp.read().decode('utf-8', errors='replace')
-        except Exception as e:
-            echo(f"Error preparing Caddy configuration: {e}", fg='red')
-            return False
-
-        if resp.status in (200, 201, 204):
-            echo(f"-----> Successfully configured Caddy for app '{app}'", fg='green')
-            return True
-        else:
-            echo(f"Warning: Caddy API configuration failed: {resp.status} {resp.reason}\n{body}", fg='yellow')
-            return False
-
-    except Exception as e:
-        echo(f"Error configuring Caddy for app '{app}': {e}", fg='red')
-        return False
-    finally:
-        pass
-
-
-def caddy_get(app=None):
-    """Get Caddy configuration using the admin API"""
-    try:
-        c = HTTPConnection('localhost', 2019, timeout=1)
-        api_path = "/config/"
-        c.request('GET', api_path)
-        resp = c.getresponse()
-        body = resp.read().decode('utf-8', errors='replace')
-        if resp.status == 200:
-            config = loads(body)
-            if app:
-                if 'apps' in config and 'http' in config['apps']:
-                    if 'servers' in config['apps']['http'] and app in config['apps']['http']['servers']:
-                        return config['apps']['http']['servers'][app]
-                    else:
-                        return None  # App-specific config not found
-                else:
-                    return None  # Invalid config structure
-            else:
-                return config  # Return full config
-        else:
-            echo(f"Error: Caddy API returned status {resp.status} - {resp.reason}", fg='red')
-            return None
-    except Exception as e:
-        echo(f"Error getting Caddy configuration: {e}", fg='red')
-        return None
-
-
-def caddy_remove(app):
-    """Remove Caddy configuration for an app using the admin API"""
-    try:
-        echo(f"-----> Removing Caddy configuration for app '{app}'", fg='yellow')
-
-        # First, get the current complete Caddy configuration
-        c = HTTPConnection('localhost', 2019, timeout=1)
-        c.request('GET', '/config/')
-        resp = c.getresponse()
-        current_config = loads(resp.read().decode('utf-8'))
-        c.close()
-
-        # Check if the app exists in the configuration
-        if ('apps' in current_config and 'http' in current_config['apps'] and
-            'servers' in current_config['apps']['http'] and app in current_config['apps']['http']['servers']):
-
-            # Remove the app from the configuration, preserving everything else
-            del current_config['apps']['http']['servers'][app]
-
-            config_data = dumps(current_config).encode('utf-8')
-            c = HTTPConnection('localhost', 2019, timeout=5)
-            c.request('POST', '/load', body=config_data,
-                      headers={'Content-Type': 'application/json'})
-            resp = c.getresponse()
-            resp.read()  # Consume the response body
-
-            if resp.status in (200, 204):
-                echo(f"-----> Successfully removed Caddy configuration for app '{app}'", fg='green')
-                return True
-            else:
-                echo(f"Warning: Failed to remove Caddy configuration for app '{app}'", fg='yellow')
-                return False
-        else:
-            echo(f"-----> No configuration found for app '{app}'", fg='yellow')
-            return True
-    except Exception as e:
-        echo(f"Error removing Caddy configuration: {e}", fg='red')
-        return False
-    finally:
-        pass
-
 # Basic deployment functions
 
 def do_deploy(app, deltas={}, newrev=None):
@@ -612,14 +784,13 @@ def do_deploy(app, deltas={}, newrev=None):
             call(f'git reset --hard {newrev}', cwd=app_path, env=env, shell=True)
         call('git submodule init', cwd=app_path, env=env, shell=True)
         call('git submodule update', cwd=app_path, env=env, shell=True)
-        compose, caddy = parse_compose(app, compose_file)
+        ensure_shared_traefik()
+        compose, traefik = parse_compose(app, compose_file)
         if not compose:
             echo(f"Error: could not parse {compose_file}", fg='red')
             return
         with open(join(APP_ROOT, app, DOCKER_COMPOSE), "w", encoding='utf-8') as f:
             f.write(safe_dump(compose))
-        if caddy:
-            caddy_config(app, caddy)
         # Record chosen mode for subsequent lifecycle ops
         mode = 'swarm' if docker_supports_swarm() else 'compose'
         cfg_override = safe_load(open(compose_file, 'r', encoding='utf-8')) if exists(compose_file) else {}
@@ -832,16 +1003,114 @@ def cmd_config_live(app):
         echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
 
 
-@command('config:caddy')
+@command('config:traefik')
 @argument('app')
-def cmd_caddy_app(app):
-    """Show Caddy configuration for an app"""
+@option('--json', 'as_json', is_flag=True, help='Output labels as JSON')
+def cmd_config_traefik(app, as_json=False):
+    """Show generated Traefik labels for an app (from saved compose)."""
     app = exit_if_invalid(app)
-    caddy_json = caddy_get(app)
-    if caddy_json:
-        echo(dumps(caddy_json, indent=2), fg='white')
-    else:
-        echo(f"Warning: app '{app}' has no Caddy config.", fg='yellow')
+    config_file = join(APP_ROOT, app, DOCKER_COMPOSE)
+    if not exists(config_file):
+        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
+        return
+    try:
+        cfg = safe_load(open(config_file, 'r', encoding='utf-8')) or {}
+        services = cfg.get('services', {}) if isinstance(cfg, dict) else {}
+        if not services:
+            echo(f"Warning: no services found in compose for '{app}'.", fg='yellow')
+            return
+        if as_json:
+            out = {}
+            for name, svc in services.items():
+                labels = svc.get('labels', {}) if isinstance(svc, dict) else {}
+                deploy = svc.get('deploy', {}) if isinstance(svc, dict) else {}
+                dlabels = deploy.get('labels', {}) if isinstance(deploy, dict) else {}
+                out[name] = {
+                    'labels': labels,
+                    'deploy_labels': dlabels
+                }
+            echo(dumps(out, indent=2), fg='white')
+            return
+        for name, svc in services.items():
+            echo(f"Service: {name}", fg='green')
+            labels = svc.get('labels', {}) if isinstance(svc, dict) else {}
+            if labels:
+                echo("  labels:", fg='white')
+                for k, v in labels.items():
+                    echo(f"    {k}={v}", fg='white')
+            deploy = svc.get('deploy', {}) if isinstance(svc, dict) else {}
+            dlabels = deploy.get('labels', {}) if isinstance(deploy, dict) else {}
+            if dlabels:
+                echo("  deploy.labels:", fg='white')
+                for k, v in dlabels.items():
+                    echo(f"    {k}={v}", fg='white')
+    except Exception as e:
+        echo(f"Error reading Traefik config: {e}", fg='red')
+
+
+@command('traefik:ls')
+@argument('app')
+def cmd_traefik_ls(app):
+    """List Traefik routers/services for an app from saved compose."""
+    app = exit_if_invalid(app)
+    config_file = join(APP_ROOT, app, DOCKER_COMPOSE)
+    if not exists(config_file):
+        echo(f"Warning: app '{app}' not deployed, no config found.", fg='yellow')
+        return
+    try:
+        cfg = safe_load(open(config_file, 'r', encoding='utf-8')) or {}
+        services = cfg.get('services', {}) if isinstance(cfg, dict) else {}
+        if not services:
+            echo(f"Warning: no services found in compose for '{app}'.", fg='yellow')
+            return
+        for name, svc in services.items():
+            labels = svc.get('labels', {}) if isinstance(svc, dict) else {}
+            deploy = svc.get('deploy', {}) if isinstance(svc, dict) else {}
+            dlabels = deploy.get('labels', {}) if isinstance(deploy, dict) else {}
+            merged = {}
+            merged.update(labels if isinstance(labels, dict) else {})
+            merged.update(dlabels if isinstance(dlabels, dict) else {})
+            routers = sorted([k for k in merged.keys() if k.startswith('traefik.http.routers.')])
+            services_lbl = sorted([k for k in merged.keys() if k.startswith('traefik.http.services.')])
+            if routers or services_lbl:
+                echo(f"Service: {name}", fg='green')
+                if routers:
+                    echo("  routers:", fg='white')
+                    for r in routers:
+                        echo(f"    {r} = {merged[r]}", fg='white')
+                if services_lbl:
+                    echo("  services:", fg='white')
+                    for s in services_lbl:
+                        echo(f"    {s} = {merged[s]}", fg='white')
+    except Exception as e:
+        echo(f"Error listing Traefik routers/services: {e}", fg='red')
+
+
+@command('traefik:inspect')
+@argument('app')
+def cmd_traefik_inspect(app):
+    """Inspect the running Traefik service/container for an app."""
+    app = exit_if_invalid(app)
+    mode = get_app_mode(app)
+    inspected = False
+    if mode == 'swarm':
+        svc_name = f"{app}_traefik"
+        try:
+            call(['docker', 'service', 'inspect', svc_name], stdout=stdout, stderr=stderr, universal_newlines=True)
+            inspected = True
+        except Exception:
+            pass
+    if not inspected:
+        try:
+            names = check_output(['docker', 'ps', '--format', '{{.Names}}'], universal_newlines=True).splitlines()
+            target = next((n for n in names if n.startswith(f"{app}-traefik")), None)
+            if target:
+                call(['docker', 'inspect', target], stdout=stdout, stderr=stderr, universal_newlines=True)
+                inspected = True
+        except Exception:
+            pass
+    if not inspected:
+        echo(f"Warning: could not find a running Traefik service/container for '{app}'.", fg='yellow')
 
 
 @command('rm')
@@ -862,7 +1131,6 @@ def cmd_destroy(app, force, wipe):
             echo("Aborted.", fg='yellow')
             return
 
-    caddy_remove(app)
     do_remove(app)
 
     paths = [join(APP_ROOT, app), join(ENV_ROOT, app), join(LOG_ROOT, app), join(GIT_ROOT, app)]
@@ -995,21 +1263,25 @@ def cmd_update():
     try:
         # Download the latest version
         echo("Downloading latest version...", fg='green')
-        response = HTTPSConnection('raw.githubusercontent.com').request('GET', KATA_RAW_SOURCE_URL)
+        parsed = urlparse(KATA_RAW_SOURCE_URL)
+        conn = HTTPSConnection(parsed.netloc)
+        conn.request('GET', parsed.path)
+        resp = conn.getresponse()
 
-        if response.status_code == 200:
+        if resp.status == 200:
+            body = resp.read().decode('utf-8')
             # Create a backup of the current script
             backup_file = f"{KATA_SCRIPT}.backup"
             copyfile(KATA_SCRIPT, backup_file)
             echo(f"Created backup at {backup_file}", fg='green')
             # Write the new version
             with open(KATA_SCRIPT, 'w', encoding='utf-8') as f:
-                f.write(response.text)
+                f.write(body)
             # Make it executable
             chmod(KATA_SCRIPT, S_IRUSR | S_IWUSR | S_IXUSR)
             echo("Update complete! Restart any running kata processes.", fg='green')
         else:
-            echo(f"Failed to download update: HTTP {response.status_code}", fg='red')
+            echo(f"Failed to download update: HTTP {resp.status}", fg='red')
     except ImportError:
         echo("Error: requests module not installed", fg='red')
         echo("Install it with: pip install requests", fg='yellow')

@@ -1,0 +1,12 @@
+# Generic container example for Kata
+# - Uses a stock HTTP echo server (traefik/whoami)
+# - Traefik labels are generated automatically; host defaults to <app>.localhost
+
+environment:
+  PORT: "80"
+
+services:
+  web:
+    image: traefik/whoami:v1.10.1
+    expose:
+      - "${PORT}"

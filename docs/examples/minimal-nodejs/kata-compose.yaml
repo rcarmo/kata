@@ -1,5 +1,5 @@
-# Minimal Python example for Kata
-# - Runs a FastAPI app with Uvicorn
+# Minimal Node.js example for Kata
+# - Runs an Express app
 # - Traefik labels are generated automatically; host defaults to <app>.localhost
 
 environment:
@@ -7,7 +7,7 @@ environment:
 
 services:
   web:
-    runtime: python
-    command: uvicorn app:app --host 0.0.0.0 --port ${PORT}
+    runtime: nodejs
+    command: npm start
     expose:
       - "${PORT}"

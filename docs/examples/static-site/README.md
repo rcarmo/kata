@@ -1,24 +1,24 @@
-# Minimal Python example
+# Static site example
 
-A tiny FastAPI app deployed with Kata and Traefik.
+A static HTML site served by Kata’s `runtime: static` BusyBox httpd image.
 
 ## Files
 
 - `kata-compose.yaml` — stack definition; Traefik labels are generated automatically
-- `app.py` — FastAPI app with a single endpoint
-- `requirements.txt` — Python deps installed into `/venv` by the runtime hook
+- `public/index.html` — sample static page
 
 ## How to try
 
 1. Ensure Kata is set up on the host: `kata setup`
 2. Copy this folder to your Kata apps directory (replace APP with your app name):
-   - `cp -a docs/examples/minimal-python "$HOME/app/APP"`
+   - `cp -a docs/examples/static-site "$HOME/app/APP"`
 3. Deploy using the internal hook (or push via git if you set that up):
    - `echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/main" | kata git-hook APP`
    - Or simply run `kata restart APP` if the app dir already exists
-4. Open https://APP.localhost/ (Kata injects Traefik with a default host rule).
+4. Open https://APP.localhost/ (or https://alias.localhost/ from the extra router labels).
 
 Notes:
 
-- If you’re using a real domain, set your host rule via Traefik labels or a `traefik:` block.
+- `DOCROOT` can be adjusted in `kata-compose.yaml` if you prefer a different folder.
+- To change hostnames, edit the `traefik.http.routers.site-alt.rule` label (it uses `Host(site.localhost,alias.localhost)` by default).
 - No host port publishing is required; Traefik shares the `traefik-proxy` Docker network with the service.
