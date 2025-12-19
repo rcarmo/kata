@@ -178,6 +178,36 @@ def traefik_is_running() -> bool:
     return False
 
 
+def ensure_docker_network(network_name: str) -> bool:
+    """Ensure a Docker network exists without erroring if it already exists."""
+    try:
+        check_output(['docker', 'network', 'inspect', network_name], stderr=STDOUT, universal_newlines=True)
+        return True
+    except Exception:
+        pass
+    try:
+        check_output(['docker', 'network', 'create', network_name], stderr=STDOUT, universal_newlines=True)
+        return True
+    except Exception as exc:
+        echo(f"Warning: could not ensure network '{network_name}': {exc}", fg='yellow')
+        return False
+
+
+def ensure_docker_volume(volume_name: str) -> bool:
+    """Ensure a Docker volume exists without erroring if it already exists."""
+    try:
+        check_output(['docker', 'volume', 'inspect', volume_name], stderr=STDOUT, universal_newlines=True)
+        return True
+    except Exception:
+        pass
+    try:
+        check_output(['docker', 'volume', 'create', volume_name], stderr=STDOUT, universal_newlines=True)
+        return True
+    except Exception as exc:
+        echo(f"Warning: could not ensure volume '{volume_name}': {exc}", fg='yellow')
+        return False
+
+
 def ensure_shared_traefik() -> None:
     """Ensure a single shared Traefik is running on this host.
 
@@ -191,15 +221,11 @@ def ensure_shared_traefik() -> None:
     volume_name = 'traefik-acme'
     acme_email = environ.get('KATA_ACME_EMAIL', 'admin@example.com')
 
-    # Ensure shared network/volume exist
-    try:
-        call(['docker', 'network', 'create', network_name], stdout=stdout, stderr=stderr, universal_newlines=True)
-    except Exception:
-        pass
-    try:
-        call(['docker', 'volume', 'create', volume_name], stdout=stdout, stderr=stderr, universal_newlines=True)
-    except Exception:
-        pass
+    # Ensure shared network/volume exist without noisy errors if already present
+    if not ensure_docker_network(network_name):
+        return
+    if not ensure_docker_volume(volume_name):
+        return
 
     # If any traefik is running, reuse it
     if traefik_is_running():
@@ -241,9 +267,18 @@ def build_default_traefik_cfg(app_name: str, services: dict) -> dict:
     if not services:
         return {}
 
-    # Pick the first declared service
-    service_name = next(iter(services.keys()))
-    service = services[service_name] or {}
+    # Pick the first declared service that is not using network_mode
+    service_name = None
+    service = None
+    for name, svc in services.items():
+        if isinstance(svc, dict) and svc.get('network_mode'):
+            continue
+        service_name = name
+        service = svc or {}
+        break
+
+    if service_name is None:
+        return {}
 
     # Heuristic: grab the first exposed container port (rightmost segment of a port mapping)
     port = 8000
@@ -318,6 +353,11 @@ def apply_traefik(app_name, compose_def, traefik_cfg):
     acme_volume_external = bool(traefik_cfg.get('acme_volume_external', True))
 
     target_service = services[service_name]
+
+    # Host network_mode services cannot be attached to traefik-proxy; skip labels.
+    if isinstance(target_service, dict) and target_service.get('network_mode'):
+        echo(f"Warning: service '{service_name}' uses network_mode; skipping Traefik labels and network attachment.", fg='yellow')
+        return
 
     # Shared traefik network/volume (external) so one Traefik can front multiple stacks
     network_name = traefik_cfg.get('network', 'traefik-proxy')
@@ -675,6 +715,13 @@ def parse_compose(app_name, filename) -> tuple:
         # Implicit Traefik: synthesize a sensible default using the first service and its port
         traefik_config = build_default_traefik_cfg(app_name, services)
 
+    # If the selected traefik target service uses network_mode, skip injection
+    if traefik_config:
+        target = traefik_config.get('service') or (next(iter(services.keys())) if services else None)
+        if target and isinstance(services.get(target), dict) and services[target].get('network_mode'):
+            echo(f"Warning: service '{target}' uses network_mode; skipping Traefik label injection.", fg='yellow')
+            traefik_config = {}
+
     if not "volumes" in data.keys():
         volumes = {
             "app": join(APP_ROOT, app_name),
@@ -713,6 +760,19 @@ def docker_supports_swarm() -> bool:
     except Exception:
         return False
 
+
+def docker_is_swarm_manager() -> bool:
+    """Return True if this node is an active swarm manager (control available)."""
+    try:
+        info = check_output(['docker', 'info', '--format', '{{.Swarm.LocalNodeState}} {{.Swarm.ControlAvailable}}'], universal_newlines=True).strip().lower()
+        parts = info.split()
+        if len(parts) >= 2:
+            state, control = parts[0], parts[1]
+            return state == 'active' and control == 'true'
+    except Exception:
+        pass
+    return False
+
 def get_app_mode(app: str) -> str:
     """Returns 'swarm' or 'compose' for this app. Default: 'compose' if swarm inactive, else 'swarm'.
        Allows override via x-kata-mode in kata-compose.yaml or .kata-mode file saved on deploy."""
@@ -734,8 +794,8 @@ def get_app_mode(app: str) -> str:
                 return mode
         except Exception:
             pass
-    # default based on swarm
-    return 'swarm' if docker_supports_swarm() else 'compose'
+    # default based on swarm manager availability
+    return 'swarm' if docker_is_swarm_manager() else 'compose'
 
 def set_app_mode(app: str, mode: str):
     app_path = join(APP_ROOT, app)
@@ -762,8 +822,8 @@ def get_compose_cmd() -> list:
 
 def require_swarm_or_warn() -> bool:
     """Ensure Docker Swarm is active; print a helpful error if not."""
-    if not docker_supports_swarm():
-        echo("Error: Docker Swarm mode is not active. This command requires Swarm.", fg='red')
+    if not docker_is_swarm_manager():
+        echo("Error: Docker Swarm manager not available on this node. This command requires a Swarm manager.", fg='red')
         echo("Tip: Initialize Swarm with 'docker swarm init' or switch app mode to 'compose' where applicable.", fg='yellow')
         return False
     return True
@@ -809,6 +869,10 @@ def do_start(app):
         echo(f"-----> Starting app '{app}' (mode: {mode})", fg='yellow')
         compose_path = join(app_path, DOCKER_COMPOSE)
         if mode == 'swarm':
+            if not docker_is_swarm_manager():
+                echo("Error: Docker Swarm manager not available on this node; cannot deploy stack.", fg='red')
+                echo("Tip: run 'docker swarm init' on a manager or switch this app to compose mode (kata mode <app> compose).", fg='yellow')
+                return
             call(['docker', 'stack', 'deploy', app, f'--compose-file={compose_path}', '--detach=true', '--resolve-image=never', '--prune'],
                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
         else:
@@ -1149,7 +1213,7 @@ def cmd_destroy(app, force, wipe):
 
 @command('docker', add_help_option=False, context_settings=dict(ignore_unknown_options=True))
 @argument('args', nargs=-1, required=True, type=UNPROCESSED)
-def cmd_ps(args):
+def cmd_docker(args):
     """Pass-through Docker commands (logs, etc.)"""
     call(['docker'] + list(args),
          stdout=stdout, stderr=stderr, universal_newlines=True)
@@ -1165,9 +1229,24 @@ def cmd_services(stack):
 
 @command('ps')
 @argument('service', nargs=-1, required=True)
-def cmd_ps(service):
-    """List processes for a service"""
-    call(['docker', 'service', 'ps', service],
+def cmd_service_ps(service):
+    """List processes for one or more services"""
+    # First argument is treated as the app name; remaining (optional) are service filters
+    app = sanitize_app_name(service[0])
+    extras = list(service[1:])
+    mode = get_app_mode(app)
+
+    if mode == 'swarm':
+        call(['docker', 'service', 'ps'] + ([f"{app}_{s}" for s in extras] if extras else [app]),
+             stdout=stdout, stderr=stderr, universal_newlines=True)
+        return
+
+    # Compose mode
+    compose_path = join(APP_ROOT, app, DOCKER_COMPOSE)
+    if not exists(compose_path):
+        echo(f"Error: compose file not found for app '{app}' at {compose_path}", fg='red')
+        return
+    call(get_compose_cmd() + ['-f', compose_path, 'ps'] + extras,
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
