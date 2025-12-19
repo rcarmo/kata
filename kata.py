@@ -35,7 +35,7 @@ if '.local' not in environ['PATH']:
 
 # === Globals - all tweakable settings are here ===
 
-KATA_RAW_SOURCE_URL = "https://raw.githubusercontent.com/piku/kata/main/refactor/kata.py"
+KATA_RAW_SOURCE_URL = "https://github.com/rcarmo/kata/raw/refs/heads/main/kata.py"
 KATA_ROOT = environ.get('KATA_ROOT', join(environ['HOME']))
 KATA_BIN = join(environ['HOME'], 'bin')
 KATA_SCRIPT = realpath(__file__)
