@@ -649,6 +649,16 @@ def docker_rebuild_runtime(runtime: str) -> bool:
     return docker_create_runtime_image(image_name, dockerfile_content)
 
 
+def docker_remove_runtime_images() -> None:
+    """Remove all built-in runtime images (kata/*)."""
+    for image_name in RUNTIME_IMAGES.keys():
+        echo(f"-----> Removing {image_name}", fg='yellow')
+        try:
+            call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True)
+        except Exception as exc:
+            echo(f"Warning: could not remove {image_name}: {exc}", fg='yellow')
+
+
 def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None):
     image = f"kata/{runtime}"
     if not docker_check_image_exists(image) and not destroy:
@@ -1289,6 +1299,13 @@ def cmd_runtime_rebuild(runtime):
         echo(f"-----> Runtime '{runtime}' rebuilt successfully", fg='green')
     else:
         echo(f"Error: failed to rebuild runtime '{runtime}'", fg='red')
+
+
+@command('runtime:clean')
+def cmd_runtime_clean():
+    """Remove all built-in runtime images (kata/*)."""
+    docker_remove_runtime_images()
+    echo("-----> Runtime images removed (kata/*)", fg='green')
 
 
 @command('traefik:dashboard')
