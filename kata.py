@@ -619,6 +619,36 @@ def docker_create_runtime_image(image_name, dockerfile_content):
         remove(dockerfile_path)
 
 
+def docker_rebuild_all_runtimes() -> bool:
+    """Force rebuild of all built-in runtime images."""
+    all_ok = True
+    for image_name, dockerfile_content in RUNTIME_IMAGES.items():
+        echo(f"-----> Rebuilding {image_name}", fg='yellow')
+        try:
+            call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True)
+        except Exception:
+            # proceed even if removal fails (image may not exist)
+            pass
+        if not docker_create_runtime_image(image_name, dockerfile_content):
+            all_ok = False
+    return all_ok
+
+
+def docker_rebuild_runtime(runtime: str) -> bool:
+    """Force rebuild of a single built-in runtime image."""
+    image_name = f"kata/{runtime}"
+    dockerfile_content = RUNTIME_IMAGES.get(image_name)
+    if not dockerfile_content:
+        echo(f"Error: unknown runtime '{runtime}'. Valid: {', '.join([i.split('/',1)[1] for i in RUNTIME_IMAGES.keys()])}", fg='red')
+        return False
+    echo(f"-----> Rebuilding {image_name}", fg='yellow')
+    try:
+        call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True)
+    except Exception:
+        pass
+    return docker_create_runtime_image(image_name, dockerfile_content)
+
+
 def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None):
     image = f"kata/{runtime}"
     if not docker_check_image_exists(image) and not destroy:
@@ -1238,6 +1268,27 @@ def cmd_traefik_inspect(app):
             pass
     if not inspected:
         echo(f"Warning: could not find a running Traefik service/container for '{app}'.", fg='yellow')
+
+
+@command('runtime:rebuild-all')
+def cmd_runtime_rebuild_all():
+    """Rebuild all built-in runtime images (python/nodejs/php/bun/static)."""
+    ok = docker_rebuild_all_runtimes()
+    if ok:
+        echo("-----> Runtime images rebuilt successfully", fg='green')
+    else:
+        echo("Warning: one or more runtime images failed to rebuild", fg='yellow')
+
+
+@command('runtime:rebuild')
+@argument('runtime', required=True)
+def cmd_runtime_rebuild(runtime):
+    """Rebuild a single built-in runtime image (python/nodejs/php/bun/static)."""
+    ok = docker_rebuild_runtime(runtime)
+    if ok:
+        echo(f"-----> Runtime '{runtime}' rebuilt successfully", fg='green')
+    else:
+        echo(f"Error: failed to rebuild runtime '{runtime}'", fg='red')
 
 
 @command('traefik:dashboard')
