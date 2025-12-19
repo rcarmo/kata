@@ -242,14 +242,18 @@ def ensure_shared_traefik() -> None:
     except Exception:
         pass
 
-    echo("-----> Starting shared Traefik router 'kata-traefik'", fg='yellow')
-    cmd = [
-        'docker', 'run', '-d', '--name', 'kata-traefik', '--restart', 'unless-stopped',
-        '--network', network_name,
-        '-p', '80:80', '-p', '443:443',
-        '-v', '/var/run/docker.sock:/var/run/docker.sock:ro',
-        '-v', f'{volume_name}:/etc/traefik',
-        TRAEFIK_IMAGE,
+    run_shared_traefik(enable_dashboard=False)
+
+
+def run_shared_traefik(enable_dashboard: bool = False, dashboard_bind: str = '127.0.0.1', dashboard_port: int = 8080):
+    """(Re)start the shared Traefik container with optional dashboard exposure."""
+    network_name = 'traefik-proxy'
+    volume_name = 'traefik-acme'
+    acme_email = environ.get('KATA_ACME_EMAIL', 'admin@example.com')
+
+    # Build port mappings
+    ports = ['80:80', '443:443']
+    entrypoints = [
         '--providers.docker=true',
         '--providers.docker.exposedbydefault=false',
         '--entrypoints.web.address=:80',
@@ -258,6 +262,29 @@ def ensure_shared_traefik() -> None:
         '--certificatesresolvers.default.acme.storage=/etc/traefik/acme.json',
         '--certificatesresolvers.default.acme.httpchallenge.entrypoint=web'
     ]
+
+    if enable_dashboard:
+        bind_addr = dashboard_bind or '127.0.0.1'
+        ports.append(f"{bind_addr}:{dashboard_port}:8080")
+        entrypoints.extend([
+            '--entrypoints.traefik.address=:8080',
+            '--api.dashboard=true',
+            '--api.insecure=true'
+        ])
+
+    echo("-----> Starting shared Traefik router 'kata-traefik'", fg='yellow')
+    cmd = [
+        'docker', 'run', '-d', '--name', 'kata-traefik', '--restart', 'unless-stopped',
+        '--network', network_name
+    ]
+    for p in ports:
+        cmd += ['-p', p]
+    cmd += [
+        '-v', '/var/run/docker.sock:/var/run/docker.sock:ro',
+        '-v', f'{volume_name}:/etc/traefik',
+        TRAEFIK_IMAGE
+    ]
+    cmd.extend(entrypoints)
     call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -506,6 +533,17 @@ def expandvars(buffer, env, default=None, skip_escaped=False):
     return sub(pattern, replace_var, buffer)
 
 
+def expand_in_obj(obj, env: dict):
+    """Recursively expand ${VAR} placeholders inside strings of nested structures."""
+    if isinstance(obj, dict):
+        return {k: expand_in_obj(v, env) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [expand_in_obj(v, env) for v in obj]
+    if isinstance(obj, str):
+        return expandvars(obj, env)
+    return obj
+
+
 def load_yaml(filename, env=None):
     if not exists(filename):
         echo(f"File not found: {filename}", fg='red')
@@ -601,7 +639,7 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
             'static': []
         }
     for cmd in cmds.get(runtime, []):
-        echo(f"Running cleanup command: {' '.join(cmd)}", fg='green')
+        echo(f"Running: {' '.join(cmd)}", fg='green')
         call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
              cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
 
@@ -627,7 +665,9 @@ def sanitize_app_name(app) -> str:
 def parse_compose(app_name, filename) -> tuple:
     """Parses the kata-compose.yaml"""
 
-    data = load_yaml(filename, base_env(app_name))
+    # First pass: load with base env so top-level vars resolve
+    env_base = base_env(app_name)
+    data = load_yaml(filename, env_base)
 
     if not data:
         return None, None
@@ -640,7 +680,10 @@ def parse_compose(app_name, filename) -> tuple:
     if "environment" in data:
         env = {k: str(v) for k, v in data["environment"].items()}
 
+    # Merge user env with base and re-expand placeholders across the loaded structure
     env = base_env(app_name, env)
+    data = expand_in_obj(data, env)
+
     # Prepare env as a dict; we'll merge into services preserving service-defined values
     # echo(f"Using environment for {app_name}: {','.join([f'{k}={v}' for k, v in env.items()])}", fg='green')
     if not "services" in data:
@@ -1174,6 +1217,31 @@ def cmd_traefik_inspect(app):
             pass
     if not inspected:
         echo(f"Warning: could not find a running Traefik service/container for '{app}'.", fg='yellow')
+
+
+@command('traefik:dashboard')
+@option('--port', 'dash_port', default=8080, show_default=True, help='Host port to bind the Traefik dashboard.')
+@option('--bind', 'dash_bind', default='127.0.0.1', show_default=True, help='Bind address for the dashboard (use 0.0.0.0 to expose externally).')
+@option('--replace/--no-replace', default=True, show_default=True, help='Replace existing kata-traefik container if present.')
+def cmd_traefik_dashboard(dash_port, dash_bind, replace):
+    """Restart shared Traefik with the dashboard enabled."""
+    network_name = 'traefik-proxy'
+    volume_name = 'traefik-acme'
+
+    if not ensure_docker_network(network_name):
+        return
+    if not ensure_docker_volume(volume_name):
+        return
+
+    if replace:
+        try:
+            call(['docker', 'rm', '-f', 'kata-traefik'], stdout=stdout, stderr=stderr, universal_newlines=True)
+        except Exception as exc:
+            echo(f"Warning: could not remove existing kata-traefik: {exc}", fg='yellow')
+
+    run_shared_traefik(enable_dashboard=True, dashboard_bind=dash_bind, dashboard_port=dash_port)
+    target = 'localhost' if dash_bind == '127.0.0.1' else dash_bind
+    echo(f"Traefik dashboard enabled at http://{target}:{dash_port}/dashboard/", fg='green')
 
 
 @command('rm')
