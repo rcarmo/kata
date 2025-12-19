@@ -245,14 +245,22 @@ def ensure_shared_traefik() -> None:
     run_shared_traefik(enable_dashboard=False)
 
 
-def run_shared_traefik(enable_dashboard: bool = False, dashboard_bind: str = '127.0.0.1', dashboard_port: int = 8080):
-    """(Re)start the shared Traefik container with optional dashboard exposure."""
+def run_shared_traefik(enable_dashboard: bool = False,
+                       dashboard_bind: str = '127.0.0.1',
+                       dashboard_port: int = 8080,
+                       web_bind: str = '80:80',
+                       websecure_bind: str = '443:443'):
+    """(Re)start the shared Traefik container with optional dashboard exposure and custom binds."""
     network_name = 'traefik-proxy'
     volume_name = 'traefik-acme'
     acme_email = environ.get('KATA_ACME_EMAIL', 'admin@example.com')
 
     # Build port mappings
-    ports = ['80:80', '443:443']
+    ports = []
+    if web_bind:
+        ports.append(web_bind)
+    if websecure_bind:
+        ports.append(websecure_bind)
     entrypoints = [
         '--providers.docker=true',
         '--providers.docker.exposedbydefault=false',
@@ -352,6 +360,15 @@ def apply_traefik(app_name, compose_def, traefik_cfg):
         echo("Warning: 'traefik.host' missing; skipping traefik labels", fg='yellow')
         return
 
+    # Support comma-separated hostnames; build an OR rule for compatibility
+    hostnames = [h.strip() for h in host.split(',') if h and h.strip()]
+    if not hostnames:
+        hostnames = [host]
+    if len(hostnames) == 1:
+        host_rule = f"Host(`{hostnames[0]}`)"
+    else:
+        host_rule = " || ".join([f"Host(`{h}`)" for h in hostnames])
+
     service_name = traefik_cfg.get('service')
     if not service_name:
         # pick first declared service
@@ -374,6 +391,9 @@ def apply_traefik(app_name, compose_def, traefik_cfg):
 
     certresolver = traefik_cfg.get('certresolver', 'default')
     enable_redirect = bool(traefik_cfg.get('enable_http_redirect', False))
+    tls_enabled = traefik_cfg.get('tls')
+    if tls_enabled is None:
+        tls_enabled = 'websecure' in entrypoints
     acme_email = traefik_cfg.get('acme_email', 'admin@example.com')
     inject_service = bool(traefik_cfg.get('inject_service', True))
     acme_volume_external = bool(traefik_cfg.get('acme_volume_external', True))
@@ -408,12 +428,13 @@ def apply_traefik(app_name, compose_def, traefik_cfg):
     service_key = app_name
 
     labels[f"traefik.enable"] = "true"
-    labels[f"traefik.http.routers.{router_name}.rule"] = f"Host(`{host}`)"
+    labels[f"traefik.http.routers.{router_name}.rule"] = host_rule
     labels[f"traefik.http.routers.{router_name}.entrypoints"] = ",".join(entrypoints)
     labels[f"traefik.http.routers.{router_name}.service"] = service_key
     labels[f"traefik.http.services.{service_key}.loadbalancer.server.port"] = str(port)
-    labels[f"traefik.http.routers.{router_name}.tls"] = "true"
-    labels[f"traefik.http.routers.{router_name}.tls.certresolver"] = certresolver
+    if tls_enabled:
+        labels[f"traefik.http.routers.{router_name}.tls"] = "true"
+        labels[f"traefik.http.routers.{router_name}.tls.certresolver"] = certresolver
 
     if enable_redirect:
         # add middleware to redirect web -> websecure
@@ -1222,8 +1243,10 @@ def cmd_traefik_inspect(app):
 @command('traefik:dashboard')
 @option('--port', 'dash_port', default=8080, show_default=True, help='Host port to bind the Traefik dashboard.')
 @option('--bind', 'dash_bind', default='127.0.0.1', show_default=True, help='Bind address for the dashboard (use 0.0.0.0 to expose externally).')
+@option('--web', 'web_bind', default='80:80', show_default=True, help='Host bind for HTTP entrypoint (host:container). Set empty to skip binding.')
+@option('--websecure', 'websecure_bind', default='443:443', show_default=True, help='Host bind for HTTPS entrypoint (host:container). Set empty to skip binding.')
 @option('--replace/--no-replace', default=True, show_default=True, help='Replace existing kata-traefik container if present.')
-def cmd_traefik_dashboard(dash_port, dash_bind, replace):
+def cmd_traefik_dashboard(dash_port, dash_bind, web_bind, websecure_bind, replace):
     """Restart shared Traefik with the dashboard enabled."""
     network_name = 'traefik-proxy'
     volume_name = 'traefik-acme'
@@ -1239,7 +1262,13 @@ def cmd_traefik_dashboard(dash_port, dash_bind, replace):
         except Exception as exc:
             echo(f"Warning: could not remove existing kata-traefik: {exc}", fg='yellow')
 
-    run_shared_traefik(enable_dashboard=True, dashboard_bind=dash_bind, dashboard_port=dash_port)
+    run_shared_traefik(
+        enable_dashboard=True,
+        dashboard_bind=dash_bind,
+        dashboard_port=dash_port,
+        web_bind=web_bind,
+        websecure_bind=websecure_bind
+    )
     target = 'localhost' if dash_bind == '127.0.0.1' else dash_bind
     echo(f"Traefik dashboard enabled at http://{target}:{dash_port}/dashboard/", fg='green')
 
