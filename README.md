@@ -77,8 +77,6 @@ Paths are rooted at `KATA_ROOT` (default: `$HOME`). The current directory names 
 - Logs: `$KATA_ROOT/logs/<app>`
 - Git bare repos: `$KATA_ROOT/repos/<app>`
 
-There is presently **no** dedicated cache directory constant (earlier docs mentioned one).
-
 Generated file: `.docker-compose.yaml` inside the app code directory (regenerated each deploy).
 
 ## Traefik Sample Labels
@@ -231,11 +229,6 @@ Selected commands (run `kata help` for full output):
 | run <service> <cmd...>       | Exec into a running container         |
 | update                       | (WIP) self‑update script              |
 
-> `update` currently attempts a raw download; harden before production use.
-
-## Examples
-
-See `docs/examples/minimal-python/` for a small FastAPI app using the Python runtime.
 
 ---
 
