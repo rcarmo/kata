@@ -296,44 +296,6 @@ def run_shared_traefik(enable_dashboard: bool = False,
     call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
-def build_default_traefik_cfg(app_name: str, services: dict) -> dict:
-    """Synthesize a default Traefik config when none is provided explicitly."""
-    if not services:
-        return {}
-
-    # Pick the first declared service that is not using network_mode
-    service_name = None
-    service = None
-    for name, svc in services.items():
-        if isinstance(svc, dict) and svc.get('network_mode'):
-            continue
-        service_name = name
-        service = svc or {}
-        break
-
-    if service_name is None:
-        return {}
-
-    # Heuristic: grab the first exposed container port (rightmost segment of a port mapping)
-    port = 8000
-    ports = service.get('ports') if isinstance(service, dict) else None
-    if isinstance(ports, list) and ports:
-        for p in ports:
-            if isinstance(p, str) and p:
-                try:
-                    port = int(str(p).split(':')[-1].split('/')[0])
-                    break
-                except Exception:
-                    continue
-
-    return {
-        'host': f"{app_name}.localhost",
-        'port': port,
-        'service': service_name,
-        'entrypoints': ['websecure'],
-        'inject_service': True,
-    }
-
 
 def apply_traefik(app_name, compose_def, traefik_cfg):
     """Inject traefik service + labels based on a simplified traefik config block.
@@ -812,9 +774,6 @@ def parse_compose(app_name, filename) -> tuple:
     if "traefik" in data.keys():
         traefik_config = data.get("traefik", {}) or {}
         del data["traefik"]
-    else:
-        # Implicit Traefik: synthesize a sensible default using the first service and its port
-        traefik_config = build_default_traefik_cfg(app_name, services)
 
     # If the selected traefik target service uses network_mode, skip injection
     if traefik_config:

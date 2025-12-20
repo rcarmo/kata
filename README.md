@@ -20,7 +20,7 @@ Mandatory:
 - **Docker** 20.10+ (Swarm optional; if inactive, Compose mode is used)
 - **Python** 3.12+ (to run `kata.py`)
 
-Optional (HTTP routing is enabled by default):
+Optional (HTTP routing via Traefik):
 
 - **Traefik** v3 on the host (containerized). Kata will create or reuse the external Docker network `traefik-proxy` and the volume `traefik-acme` for certificate storage, and will start a shared Traefik container (`kata-traefik`) if none is running.
 
@@ -30,18 +30,20 @@ Tested on Debian 12/13, recent Ubuntu, and macOS with Docker Desktop.
 
 ## Traefik Routing
 
-Kata generates Traefik labels automatically and enforces a single shared Traefik per host. You do **not** add a `traefik:` block. The defaults are enough for local dev and small self‑hosted setups.
+Traefik is **opt-in**. If you do not provide a `traefik:` block, Kata will not add labels or inject Traefik. Add a `traefik` block to the root of your `kata-compose.yaml` to enable routing.
 
-Key defaults:
+You can always add Traefik labels manually on any service; the `traefik` block is just a convenience that generates a consistent set of labels for one target service.
 
-- Router name: `<app>-websecure`
-- Host rule: `${DOMAIN_NAME:-<app>.localhost}`
-- Entry points: `websecure` (with an automatic `web` → `websecure` redirect rule)
-- Service port: first declared `ports`/`expose` entry; otherwise Kata assumes `8000` — ensure the service actually listens there or set `traefik.http.services.<name>.loadbalancer.server.port`
-- TLS: enabled; certificates stored in the external volume `traefik-acme`
-- Network: services are attached to the external Docker network `traefik-proxy`
+Key defaults (when `traefik` is provided):
 
-Kata will start or reuse a shared Traefik container named `kata-traefik` on the `traefik-proxy` network with the `traefik-acme` volume. If you already run Traefik, keep it attached to that network/volume and Kata will reuse it.
+- Router name: `<app>`
+- Host rule: `traefik.host` (required)
+- Entry points: `websecure` by default; `web` → `websecure` redirect only if you set `enable_http_redirect`
+- Service: `traefik.service` (defaults to the first service listed if omitted); declare `ports`/`expose` and set `traefik.port` if it differs from the declared port (defaults to 8000 if unset)
+- TLS: enabled by default when using `websecure`; certificates stored in the external volume `traefik-acme`
+- Network: only the Traefik-targeted service is attached to the external Docker network `traefik-proxy`; other services are untouched
+
+Kata can start or reuse a shared Traefik container named `kata-traefik` on the `traefik-proxy` network with the `traefik-acme` volume. If you already run Traefik, keep it attached to that network/volume and Kata will reuse it.
 
 ### Customizing
 
@@ -54,6 +56,18 @@ services:
       traefik.http.routers.websecure.rule: Host(`app.example.com`)
       traefik.http.routers.websecure.entrypoints: websecure
       traefik.http.services.web.loadbalancer.server.port: "5000"
+```
+
+#### Service with no exposed port (not routed)
+
+If a service does not declare `ports` or `expose`, Traefik will not be able to reach it. This is fine for workers/cron jobs:
+
+```yaml
+services:
+  worker:
+    image: busybox
+    command: ["sh", "-c", "echo worker started; sleep infinity"]
+    # No ports/expose → not routable via Traefik
 ```
 
 ### Inspecting Traefik config
@@ -112,6 +126,8 @@ Recommended to set:
 - `BIND_ADDRESS` (default `127.0.0.1` if omitted in your own config logic)
 - `DOMAIN_NAME` (for host matchers / TLS)
 
+Declare `ports` or `expose` on the service you want Traefik to reach; Kata no longer adds these automatically. If you prefer a different target, set `traefik.service` (and `traefik.port` if it differs from the declared port).
+
 Automatically injected into each service unless already set: the base variables above.
 
 For more details on Traefik labels, see the [Traefik reference](https://doc.traefik.io/traefik/routing/routers/).
@@ -136,6 +152,8 @@ kata traefik:ls
   - DNS/TLS: verify your host rule matches a reachable domain and that ports 80/443 are open to the world.
 
 ## Examples
+
+Each example declares a `PORT` and exposes it on the `web` service so Traefik can route to it. By default the first service (`web`) is targeted; set `traefik.service`/`traefik.port` if you need a different mapping.
 
 - [docs/examples/minimal-python](docs/examples/minimal-python) — FastAPI on the Python runtime
 - [docs/examples/minimal-nodejs](docs/examples/minimal-nodejs) — Express on the Node.js runtime
@@ -179,6 +197,7 @@ services:
 ```
 
 Kata will build (once) or reuse a `kata/<runtime>` image from an internal Dockerfile, bind‑mount app/config/data/venv, and run runtime-specific prep:
+
 - python: create venv + `pip install -r requirements.txt`
 - nodejs: `npm install`
 - php: `composer install --no-dev --optimize-autoloader`
@@ -228,7 +247,6 @@ Selected commands (run `kata help` for full output):
 | docker:services / ps         | Inspect Swarm/Compose processes       |
 | run <service> <cmd...>       | Exec into a running container         |
 | update                       | (WIP) self‑update script              |
-
 
 ---
 

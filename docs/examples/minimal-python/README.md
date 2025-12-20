@@ -4,7 +4,7 @@ A tiny FastAPI app deployed with Kata and Traefik.
 
 ## Files
 
-- `kata-compose.yaml` — stack definition; Traefik labels are generated automatically
+- `kata-compose.yaml` — stack definition; Traefik routing is configured via the `traefik` block
 - `app.py` — FastAPI app with a single endpoint
 - `requirements.txt` — Python deps installed into `/venv` by the runtime hook
 
@@ -16,7 +16,7 @@ A tiny FastAPI app deployed with Kata and Traefik.
 3. Deploy using the internal hook (or push via git if you set that up):
    - `echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/main" | kata git-hook APP`
    - Or simply run `kata restart APP` if the app dir already exists
-4. Open https://APP.localhost/ (Kata injects Traefik with a default host rule).
+4. Open https://app.localhost/ (change the host in the `traefik` block if needed).
 
 Notes:
 

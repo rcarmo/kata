@@ -16,7 +16,7 @@ Shows how to keep a database on an internal network while letting Traefik reach 
 3. Deploy:
    - `echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/main" | kata git-hook APP`
    - Or `kata restart APP` if the app dir already exists
-4. Open https://APP.localhost/.
+4. Open https://app.localhost/ (change the host in the `traefik` block if needed).
 
 Notes
 

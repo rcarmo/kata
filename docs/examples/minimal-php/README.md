@@ -4,7 +4,7 @@ A tiny PHP app served by the built-in PHP server using Kata’s `runtime: php` s
 
 ## Files
 
-- `kata-compose.yaml` — stack definition; Traefik labels are generated automatically
+- `kata-compose.yaml` — stack definition; Traefik routing is configured via the `traefik` block (HTTP-only in this example)
 - `public/index.php` — single endpoint returning JSON
 - `composer.json` — present so the runtime hook can run `composer install`
 
@@ -16,7 +16,7 @@ A tiny PHP app served by the built-in PHP server using Kata’s `runtime: php` s
 3. Deploy using the internal hook (or push via git if you set that up):
    - `echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/main" | kata git-hook APP`
    - Or simply run `kata restart APP` if the app dir already exists
-4. Open https://APP.localhost/.
+4. Open http://app.localhost/ (HTTP only; change the host in the `traefik` block if needed).
 
 Notes:
 

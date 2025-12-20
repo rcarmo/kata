@@ -5,6 +5,13 @@
 environment:
   PORT: "80"
 
+traefik:
+  host: "app.localhost"   # change to your domain
+  service: web
+  port: 80
+  entrypoints: ["websecure"]
+  enable_http_redirect: true
+
 services:
   web:
     image: traefik/whoami:v1.10.1

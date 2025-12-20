@@ -5,6 +5,13 @@
 environment:
   PORT: "8000"
 
+traefik:
+  host: "app.localhost"   # change to your domain
+  service: web
+  port: 8000
+  entrypoints: ["websecure"]
+  enable_http_redirect: true
+
 services:
   web:
     runtime: bun

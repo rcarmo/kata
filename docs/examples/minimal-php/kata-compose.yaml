@@ -6,6 +6,14 @@ environment:
   PORT: "8000"
   DOCROOT: "/app/public"
 
+traefik:
+  host: "app.localhost"   # change to your domain
+  service: web
+  port: 8000
+  entrypoints: ["web"]
+  enable_http_redirect: false
+  tls: false
+
 services:
   web:
     runtime: php
