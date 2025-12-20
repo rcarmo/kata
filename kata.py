@@ -762,9 +762,6 @@ def parse_compose(app_name, filename) -> tuple:
             if isinstance(service["environment"], dict):
                 service["environment"].setdefault("PORT", "8000")
                 service["environment"].setdefault("DOCROOT", "/app")
-            # Ensure Traefik can reach the container without host port publishing
-            if "ports" not in service and "expose" not in service:
-                service["expose"] = ["8000"]
 
         if not "image" in service:
             if "runtime" in service:
