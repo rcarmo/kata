@@ -955,7 +955,7 @@ def do_stop(app):
                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
-def do_remove(app):
+def do_remove(app, wipe: bool = False):
     app_path = join(APP_ROOT, app)
     if exists(join(app_path, DOCKER_COMPOSE)):
         yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
@@ -972,7 +972,10 @@ def do_remove(app):
             call(['docker', 'stack', 'rm', app],
                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
         else:
-            call(get_compose_cmd() + ['-f', compose_path, 'down', '--volumes', '--remove-orphans'],
+            cmd = get_compose_cmd() + ['-f', compose_path, 'down', '--remove-orphans']
+            if wipe:
+                cmd.insert(-1, '--volumes')
+            call(cmd,
                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -1320,18 +1323,74 @@ def cmd_destroy(app, force, wipe):
             echo("Aborted.", fg='yellow')
             return
 
-    do_remove(app)
+    do_remove(app, wipe=wipe)
 
     paths = [join(APP_ROOT, app), join(ENV_ROOT, app), join(LOG_ROOT, app), join(GIT_ROOT, app)]
+    data_path = join(DATA_ROOT, app)
+    config_path = join(CONFIG_ROOT, app)
     if wipe:
-        paths.extend([join(DATA_ROOT, app), join(CONFIG_ROOT, app)])
+        paths.extend([data_path, config_path])
+
+    # Pre-wipe contents from inside a root container.
+    # This avoids host-side PermissionError when files were created as root inside containers.
+    mount_map = [
+        (join(APP_ROOT, app), '/app'),
+        (join(ENV_ROOT, app), '/venv'),
+        (join(LOG_ROOT, app), '/logs'),
+        (join(GIT_ROOT, app), '/repos'),
+    ]
+    if wipe:
+        mount_map.extend([
+            (data_path, '/data'),
+            (config_path, '/config'),
+        ])
+
+    mounts: list[str] = []
+    targets: list[str] = []
+    for host_path, container_path in mount_map:
+        if exists(host_path):
+            mounts += ['-v', f"{realpath(host_path)}:{container_path}"]
+            targets.append(container_path)
+
+    if mounts:
+        try:
+            echo(f"-----> {'Wiping all' if wipe else 'Removing code'} app directories", fg='yellow')
+            # Run BusyBox as root (explicitly). On bind mounts this can delete root-owned files.
+            # Note: on rootless Docker / userns remap, ownership semantics may differ.
+            # It cannot remove the mountpoint itself, so we also fix perms/ownership
+            # on the directory to let host-side rmtree() remove it.
+            wipe_script = (
+                "for d; do "
+                "rm -rf \"$d\" 2>/dev/null || true; "
+                #f"chown {PUID}:{PGID} \"$d\" 2>/dev/null || true; "
+                #"chmod u+rwx \"$d\" 2>/dev/null || true; "
+                "done"
+            )
+            call(
+                ['docker', 'run', '--rm', '--user', '0:0']
+                + mounts
+                + [
+                    'busybox:stable-musl',
+                    'sh',
+                    '-c',
+                    wipe_script,
+                    'sh',
+                ]
+                + targets,
+                stdout=stdout,
+                stderr=stderr,
+                universal_newlines=True,
+            )
+        except Exception as exc:
+            echo(f"Warning: {'Wipe' if wipe else 'Remove'} failed: {exc}", fg='yellow')
 
     for path in paths:
-        if exists(path):
-            try:
-                rmtree(path)
-            except Exception as e:
-                echo(f"Error removing {path}: {str(e)}", fg='red')
+        if not exists(path):
+            continue
+        try:
+            rmtree(path)
+        except Exception as e:
+            echo(f"Error removing {path}: {str(e)}", fg='red')
     echo(f"-----> '{app}' destroyed", fg='green')
     if not wipe:
         echo("Data and config directories were not deleted. Use --wipe to remove them.", fg='yellow')
