@@ -28,7 +28,7 @@ Optional (HTTP routing via Traefik):
 
 > systemd / Podman are **not** required by the current code path (earlier design notes referenced them).
 
-Tested on Debian 12/13, recent Ubuntu, and macOS with Docker Desktop.
+Tested on Debian 12/13, recent Ubuntu, and macOS with Colima/Docker Desktop.
 
 ## Traefik Routing
 
