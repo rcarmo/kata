@@ -1,5 +1,7 @@
 # Kata: Current Implementation Specification
 
+![Kata logo](kata-256.png)
+
 > This document reflects **what `kata.py` implements today**. Earlier design goals (systemd units, Podman quadlets, richer schema) are not yet present; they appear below under “Planned / Roadmap”.
 
 ## Overview

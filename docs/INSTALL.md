@@ -1,5 +1,7 @@
 # Installation Guide for Kata
 
+![Kata logo](kata-256.png)
+
 Kata is a lightweight wrapper around Docker (Compose or Swarm) with implicit Traefik routing. These steps target a fresh Linux host or macOS with Docker Desktop.
 
 ## Prerequisites

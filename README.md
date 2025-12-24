@@ -1,5 +1,7 @@
 # kata
 
+![Kata logo](docs/kata-256.png)
+
 > Kata (型) means _form / model / pattern_. This project provides a tiny “micro-PaaS” wrapper around Docker (Compose or Swarm) with implicit HTTP routing via Traefik.
 
 ## What it does (current implementation)

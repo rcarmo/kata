@@ -1,5 +1,7 @@
 # Kata Manual
 
+![Kata logo](kata-256.png)
+
 A practical guide to deploying and managing apps with Kata (micro-PaaS on Docker) and its implicit Traefik routing.
 
 ## What is Kata?
