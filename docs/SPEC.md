@@ -1,472 +1,249 @@
-# Kata: Current Implementation Specification
+# Kata: Specification
 
 ![Kata logo](kata-256.png)
 
-> This document reflects **what `kata.py` implements today**. Earlier design goals (systemd units, Podman quadlets, richer schema) are not yet present; they appear below under “Planned / Roadmap”.
+> This document reflects **what `kata.py` implements today** and the **near-term design direction**. It is the single, consolidated spec for Kata; where it disagrees with `kata.py`, the code is authoritative and this document should be corrected.
 
 ## Overview
 
-Kata is a single‑file micro-PaaS that deploys applications from git pushes (or manual triggers) onto Docker using either **Swarm stacks** or **Compose** and (optionally) configures **Caddy** for HTTP(S) routing via its Admin API. It provides a minimal opinionated layer: parse a `kata-compose.yaml`, generate a `.docker-compose.yaml`, ensure runtime images, deploy, and optionally register a Caddy server block.
+Kata is a single-file (`kata.py`, Python 3.12+) micro-PaaS — a Piku-style refactor — that deploys applications from git pushes (or manual triggers) onto Docker, using either **Swarm stacks** or **Compose**, with optional implicit HTTP(S) routing through **Traefik**.
+
+The pipeline is: parse a `kata-compose.yaml` → merge environment → ensure runtime images → generate a `.docker-compose.yaml` → deploy via Swarm/Compose → (optionally) generate Traefik labels for one target service.
 
 Key properties:
-* Single Python 3.12+ script (`kata.py`), no external DB
-* Uses bind‑mounted host directories instead of named volumes (unless supplied by user)
-* Lightweight runtime image bootstrap for Python / NodeJS when `runtime:` is declared per service
-* Deterministic environment merging with per‑service overrides
-* Optional Caddy server configuration injection (add / remove only your app’s server)
-* Git push deployment via internal `git-*` commands and forced authorized_keys commands
 
-Non‑goals (current state): process scaling beyond Docker primitives, declarative build phases, systemd or Podman orchestration, multi-node scheduling beyond Swarm’s native behavior, advanced TLS/cloud provider automation.
+- Single Python script, no external database, only `click` + `pyyaml` runtime deps
+- Bind-mounted host directories under `$KATA_ROOT` instead of named volumes (unless the user supplies their own `volumes:` mapping)
+- On-demand runtime image bootstrap for `python`, `nodejs`, `php`, `bun`, and `static`
+- Deterministic environment merging with per-service overrides
+- Opt-in Traefik routing via a `traefik:` block (generates consistent labels for one service)
+- Git-push deployment via internal `git-*` commands and forced `authorized_keys` commands
+- Per-app deploy mode (`swarm`/`compose`) auto-selected from host state, overridable
+
+**Non-goals (current state):** horizontal scaling abstractions beyond Docker/Swarm primitives, declarative build phases, systemd/Podman orchestration, multi-node scheduling beyond Swarm's native behavior, integrated log aggregation, cloud/DNS automation.
+
+> **Removed:** Caddy integration is gone. A `caddy:` top-level key is now a hard error (`kata.py` exits with a message pointing to Traefik). systemd/Podman quadlet design notes from earlier drafts are not implemented.
 
 ## Core Architecture (Implemented)
 
 ### Components
 
 1. **Git-based deployment**
-   * Bare repo under `$KATA_ROOT/repos/<app>`
-   * `post-receive` hook invokes `kata.py git-hook <app>`
-   * Hook triggers `do_deploy()` which refreshes working tree and regenerates config
+   - Bare repo under `$KATA_ROOT/repos/<app>`
+   - `post-receive` hook invokes `kata.py git-hook <app>`
+   - First push clones the bare repo into `app/<app>`; the hook triggers `do_deploy()` which fetches/resets the working tree, regenerates config, and deploys
 2. **Container orchestration**
-   * Docker Swarm (`docker stack deploy`) if Swarm active, else Docker Compose (`docker compose up -d`)
-   * Per‑app mode selectable (`kata mode <app> [compose|swarm]` or `x-kata-mode:` key)
+   - Docker Swarm (`docker stack deploy <app> --compose-file … --resolve-image=never --prune`) when Swarm is active
+   - Docker Compose (`docker compose up -d --remove-orphans`) otherwise
+   - Per-app mode selectable via `kata mode <app> [compose|swarm]`, `x-kata-mode:` key, or persisted `.kata-mode` file
 3. **Runtime images**
-   * On-demand build of `kata/python` or `kata/nodejs` when a service defines `runtime: python|nodejs`
-   * Injects volumes: app, config, data, venv
-   * Python runtime creates venv and installs `requirements.txt` if present
+   - On-demand build of `kata/<runtime>` from an embedded Dockerfile when a service declares `runtime: python|nodejs|php|bun|static`
+   - Injects default bind volumes: `app`, `config`, `data`, `venv`
+   - Runtime-specific prep on deploy (venv/pip, npm, composer, bun install; static needs none)
 4. **Environment merging**
-   * Base (paths + PUID/PGID) → top-level `environment:` → config file `ENV` / `.env` → service environment (list or mapping) with service keys winning
-5. **Caddy integration**
-   * Optional top-level `caddy:` server object injected into existing Caddy configuration at `/apps/http/servers/<app>` via Admin API
-   * Removal cleans only that server entry
+   - Base (paths + `PUID`/`PGID`) → top-level `environment:` → config file `ENV`/`.env` → service environment (list or mapping), with service-defined keys winning
+5. **Traefik integration (opt-in)**
+   - A top-level `traefik:` block generates labels for one target service and attaches it to the external `traefik-proxy` network
+   - Kata ensures/reuses a shared `kata-traefik` container, the `traefik-proxy` network, and the `traefik-acme` volume
 6. **Secrets (Swarm only)**
-   * Simple passthrough to `docker secret` commands (`secrets:set|ls|rm`) gated by Swarm detection
+   - Thin passthrough to `docker secret` (`secrets:set|ls|rm`), gated by Swarm detection (warns and no-ops otherwise)
 
-## Configuration Format (kata-compose.yaml)
+## Directory Structure
 
-`kata-compose.yaml` is a **Compose-like** YAML. Kata reads a subset sufficient to:
-* Determine services and their runtime/image/command/ports/volumes/environment
-* Optionally capture a `caddy:` server object (NOT full Caddy root config)
-* Optionally set deployment mode via `x-kata-mode: compose|swarm`
+Rooted at `$KATA_ROOT` (default `$HOME`). Note the **singular** directory names:
 
-Unsupported (currently ignored) top-level keys from earlier design: `version`, `build`, `app`, `networks`, `volumes` (unless user supplies explicit volumes mapping which is passed through), custom scaling fields (`instances`), scheduled tasks, CloudFlare settings.
+| Path | Purpose | Mount |
+|------|---------|-------|
+| `app/<app>` | Working tree (checked-out code) | `/app` |
+| `data/<app>` | Persistent data | `/data` |
+| `config/<app>` | Config overrides (`ENV` / `.env`) | `/config` |
+| `envs/<app>` | Virtual env / runtime state | `/venv` |
+| `logs/<app>` | Reserved (not actively written by kata.py) | `/logs` |
+| `repos/<app>` | Bare git repo (push target) | — |
 
-### Minimal Structure Example
+Generated per deployment: `app/<app>/.docker-compose.yaml` (regenerated each deploy). Per-app mode persisted in `app/<app>/.kata-mode`.
 
-```yaml
-environment:
-  PORT: "8000"
-  DOMAIN_NAME: "example.test"
+## Configuration Format (`kata-compose.yaml`)
 
-services:
-  web:
-    runtime: python
-    command: uvicorn app:app --host 0.0.0.0 --port $PORT
-    ports:
-      - "127.0.0.1:$PORT:$PORT"  # Compose mode or single-host use
+A **Compose-like** YAML. Kata reads a subset and passes the rest through to the generated `.docker-compose.yaml`.
 
-caddy:
-  listen: [":80", ":443"]
-  routes:
-    - match: [{ host: ["$DOMAIN_NAME"] }]
-      handle:
-        - handler: reverse_proxy
-          upstreams: [{ dial: "127.0.0.1:$PORT" }]
+Recognized top-level keys:
 
-x-kata-mode: compose  # optional override
-```
+- `environment:` — mapping merged into every service (optional)
+- `services:` — service definitions (Compose-compatible, plus Kata extensions below)
+- `traefik:` — optional routing block (see below); consumed and stripped before generation
+- `volumes:` — optional; if omitted, Kata injects four bind-mount volumes (`app`, `config`, `data`, `venv`)
+- `x-kata-mode: compose|swarm` — optional per-app deploy mode override
 
-### Service Runtime Selection
-Provide either:
-* `runtime: python|nodejs` (Kata supplies `image:` and mounts) OR
-* Explicit `image: repo/name:tag` (no runtime bootstrap performed)
+A top-level `caddy:` key is rejected with an error.
 
-### Environment Forms
-Service `environment:` may be:
-* Mapping (`KEY: value`)
-* List (`["KEY=VALUE", "BARE_KEY"]`) — normalized; bare keys default to empty string
+### Service extensions
 
-## Directory Structure (Current)
+- `runtime: python|nodejs|php|bun|static` — Kata supplies `image: kata/<runtime>` and default mounts, and runs runtime prep. Deleted from the generated service.
+- `static: true` (shorthand) — sets `image: kata/static`, defaults `PORT=8000`, `DOCROOT=/app`.
+- If you supply `image:` yourself, **no** runtime automation runs.
+- If a service omits `volumes:`, Kata injects `["app:/app", "config:/config", "data:/data", "venv:/venv"]`. Custom volumes are honored (with a warning).
+- A service with neither `image` nor `runtime` and no `command` triggers a warning and is skipped for command handling.
 
-Kata organizes files under `$KATA_ROOT` (default `$HOME`):
+### Environment forms
 
-| Path | Purpose |
-|------|---------|
-| `app/<app>` | Working tree (checked out code) |
-| `data/<app>` | Persistent data (bind mounted as `data`) |
-| `config/<app>` | Config overrides (`ENV` / `.env`) |
-| `envs/<app>` | Virtual env / runtime state (`/venv` mount) |
-| `logs/<app>` | (Reserved for future log handling; not actively written by kata.py) |
-| `repos/<app>` | Bare git repo (push target) |
+Service `environment:` may be a mapping (`KEY: value`) or a list (`["KEY=VALUE", "BARE_KEY"]`). Lists are normalized to a mapping; bare keys default to empty string. Env placeholders (`$VAR`) are expanded across the loaded structure.
 
-Generated per deployment: `app/<app>/.docker-compose.yaml`
+### Ports / exposure
 
-## Supported Runtimes (Implemented)
+Kata does **not** auto-add `ports`/`expose`. Declare them explicitly on any service you want reachable (directly or via Traefik).
 
-Currently implemented:
+## Traefik Routing (opt-in)
 
-1. **Python**
-   * Debian slim base, installs python3 + venv + pip
-   * Creates `/venv`, installs `requirements.txt` if present
-2. **NodeJS**
-   * Debian slim base, installs node+npm+yarn, runs `npm install`
-
-Planned (not yet): Go, Rust, generic container build orchestration, static site shortcuts.
-
-## `kata-compose.yaml` Reference (Subset)
-
-### Top-level `environment:`
+Provide a `traefik:` block to generate a consistent set of labels for **one** target service:
 
 ```yaml
-environment:
-  KEY: value
-  PORT: 8000
+traefik:
+  host: app.example.com        # required (traefik.host)
+  service: web                 # optional; defaults to first service listed
+  port: 8000                   # optional; defaults to declared port, else 8000
+  enable_http_redirect: false  # optional; web → websecure redirect
 ```
 
-### Services Section
+Behavior:
 
-Compose-like structure. Kata uses only a subset:
+- Router name: `<app>`; host rule from `traefik.host` (required)
+- Entry points: `websecure` by default; `web → websecure` redirect only if `enable_http_redirect`
+- TLS enabled by default on `websecure`; certs stored in external volume `traefik-acme`
+- Only the targeted service is attached to the external `traefik-proxy` network; other services are untouched
+- If the target service uses `network_mode`, label injection is skipped (with a warning)
 
-```yaml
-services:
-  service_name:
-    runtime: python            # OR image: repo/name:tag
-    command: your start cmd
-    ports:
-      - "127.0.0.1:8000:8000"
-    volumes:                   # optional custom mapping
-      - app:/app               # if omitted Kata injects default named bind volumes
-    environment:               # optional, list or mapping
-      KEY: value
-```
+You can always set Traefik labels manually on a service instead of (or in addition to) the `traefik:` block. Kata ensures/reuses a shared `kata-traefik` container; if you already run Traefik on the `traefik-proxy` network with the `traefik-acme` volume, Kata reuses it.
 
-### Caddy Section (Server Object Only)
+## Supported Runtimes
 
-Provide a single **server object** (NOT full root config):
+| Runtime | Base | Prep on deploy |
+|---------|------|----------------|
+| `python` | Debian trixie-slim | create `/venv`, `pip install -r requirements.txt` |
+| `nodejs` | Debian trixie-slim | `npm install` |
+| `php` | Debian trixie-slim | `composer install --no-dev --optimize-autoloader` |
+| `bun` | Debian trixie-slim | `bun install` |
+| `static` | BusyBox `httpd` (`kata/static`) | none; serves `DOCROOT` (default `/app`) on `PORT` (default `8000`) |
 
-```yaml
-caddy:
-  listen: [":80", ":443"]
-  routes:
-    - match:
-        - host: ["example.com"]
-      handle:
-        - handler: reverse_proxy
-          upstreams:
-            - dial: "service_name:8000"
-  automatic_https:
-    disable: false
-```
-
-### Automatic Volume Binding
-If the top-level YAML lacks a `volumes:` mapping, Kata creates one with four bind mounts (`app`, `config`, `data`, `venv`) pointing to host paths. A service without explicit `volumes:` gets default shorthand mounts (`app:/app`, etc.).
-
-## Caddy Integration (Implemented Path)
-
-1. Load YAML, expand env vars
-2. Extract `caddy:` server object (validate minimal structure: list types etc.)
-3. GET current full Caddy config (`/config/`)
-4. Insert/replace `apps.http.servers[app]` with provided object; POST to `/load`
-5. On removal, delete that key and POST updated config
-
-No automatic derivation of routes, TLS policies, or redirects is performed; you supply them.
+Images are built once as `kata/<runtime>` and reused. Rebuild via `runtime:rebuild[-all]`; remove via `runtime:clean`.
 
 ## Environment Merging Rules
 
 Order of precedence (last wins):
-1. Base variables (PUID, PGID, path constants per app)
-2. Top-level `environment:` in `kata-compose.yaml`
-3. `ENV` or `.env` file inside `config/<app>`
-4. Service-level environment entries
 
-During service normalization:
-* List form is converted to a mapping
-* Base variables are added only if not already defined by the service
+1. Base variables: `PUID`, `PGID`, and per-app root paths (`APP_ROOT`, `DATA_ROOT`, `ENV_ROOT`, `CONFIG_ROOT`, `GIT_ROOT`, `LOG_ROOT`)
+2. Top-level `environment:` in `kata-compose.yaml`
+3. `ENV` or `.env` in `config/<app>`
+4. Service-level `environment` (list or mapping)
+
+During normalization, list form is converted to a mapping and base variables are added to a service only if not already defined there.
 
 ## Git / SSH Flow
 
-* Authorized public keys appended with forced command referencing `kata.py`
-* `git-receive-pack` / `git-upload-pack` are passthrough commands used internally
-* After push, `git-hook` receives refs and triggers `do_deploy`
+- `setup:ssh <pubkey>` appends an `authorized_keys` entry with a forced command referencing `kata.py`
+- `git-receive-pack` / `git-upload-pack` (hidden) are passthroughs invoked via `git-shell`; `git-receive-pack` initializes the bare repo and installs the `post-receive` hook on first use
+- After a push, the hook pipes ref updates to `git-hook <app>`, which clones on first deploy and calls `do_deploy(app, newrev=…)`
+
+Manual trigger:
+
+```bash
+echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/main" | kata git-hook <app>
+```
 
 ## CLI (Implemented Commands)
 
 | Command | Summary |
 |---------|---------|
-| setup | Create root directory skeleton |
-| ls | List apps (mark running) |
-| config:stack <app> | Show original `kata-compose.yaml` |
-| config:docker <app> | Show generated `.docker-compose.yaml` |
-| config:caddy <app> | Show Caddy server JSON for app |
-| restart / stop / rm <app> | Lifecycle operations |
-| mode <app> [mode] | Get/set deployment mode |
-| secrets:set/ls/rm | Manage Swarm secrets (Swarm only) |
-| docker ... | Passthrough to `docker` |
-| docker:services <stack> | List services in a stack |
-| ps <service...> | Show tasks for a service (Swarm) |
-| run <service> <cmd...> | Exec inside a container |
-| setup:ssh <pubkey> | Register SSH key (forced command) |
-| update | Attempt self-update from upstream source |
-
-Not implemented (earlier spec): deploy, logs, config:set/unset, validate, migrate, scaling flags, schedule.
+| `setup` | Create root directory skeleton |
+| `setup:ssh <pubkey>` | Register SSH key with forced command (`-` for stdin) |
+| `ls` | List apps; `*` marks any app with a running `‹app›-*` container |
+| `config:stack <app>` | Show original `kata-compose.yaml` |
+| `config:docker <app>` | Show generated `.docker-compose.yaml` |
+| `config:traefik <app> [--json]` | Show generated Traefik labels/config |
+| `traefik:ls <app>` | List routers/services for the stack |
+| `traefik:inspect <app>` | Show labels per service |
+| `traefik:dashboard [--port/--bind/--web/--websecure/--off/--replace]` | Restart shared Traefik with/without dashboard |
+| `restart <app>` | Stop then start the whole app |
+| `stop <app>` | Stop the app (stack rm / compose down) |
+| `rm <app> [--force] [--wipe]` | Remove app; `--wipe` also deletes data/config (root-container wipe of bind mounts) |
+| `mode <app> [compose\|swarm]` | Get/set deploy mode (restarts on change) |
+| `secrets:set\|ls\|rm` | Manage Swarm secrets (Swarm only) |
+| `runtime:rebuild-all` / `runtime:rebuild <rt>` / `runtime:clean` | Manage runtime images |
+| `docker …` | Passthrough to `docker` |
+| `docker:services <stack>` | `docker stack services` |
+| `ps <app> [service…]` | Tasks for an app/services (Swarm `service ps`, else `compose ps`) |
+| `run <service> <cmd…>` | `docker exec -ti <service> <cmd>` |
+| `scp …` | Passthrough to `scp` |
+| `update` | Self-update `kata.py` from the raw GitHub source (writes `.backup`) |
+| `help` | Show CLI help |
+| `git-hook` / `git-receive-pack` / `git-upload-pack` | Internal (hidden) |
 
 ## Deployment Sequence (Actual)
 
-1. Git push triggers `git-hook`
-2. Update working tree (`git fetch/reset/submodule update`)
-3. Parse `kata-compose.yaml` → merge env → build runtime image if needed → write `.docker-compose.yaml`
-4. Inject Caddy server (if provided)
-5. Deploy via Swarm or Compose (mode logic)
+1. Git push triggers `git-hook` (first push also clones into `app/<app>`)
+2. Update working tree: `git fetch`, `git reset --hard <newrev>`, submodule init/update
+3. `ensure_shared_traefik()`
+4. `parse_compose`: merge env → build runtime image(s) if needed → apply Traefik labels → write `.docker-compose.yaml`
+5. Record mode (`x-kata-mode` overrides host autodetect) and `do_start` via Swarm or Compose
 
 ## Security (Current)
 
-* SSH key forced-command restrictions
-* Docker isolation only (no systemd sandboxing / Podman yet)
-* Caddy TLS automation only if your server object config triggers it (standard Caddy behavior)
+- SSH forced-command restrictions via `authorized_keys`
+- Docker isolation only (no systemd sandboxing / Podman)
+- Traefik TLS automation via standard ACME (`traefik-acme` volume) when `websecure` is used
+- `rm --wipe` runs a root BusyBox container to delete root-owned files on bind mounts before host-side cleanup; semantics differ under rootless/userns-remap Docker
 
 ## Logging (Current)
 
-* Kata itself prints to stdout / stderr
-* Container logs accessible via `docker` / `kata docker ...` commands (no integrated log aggregation)
+- Kata prints to stdout/stderr
+- Container logs via `docker` / `kata docker logs …`; no integrated aggregation. `logs/<app>` is reserved but not written by kata.py.
 
-## Examples
+---
 
-### Simple Python Web Application Without Caddy
-```yaml
-version: "1.0"
+## Design Direction: SSH-friendly per-container operations
 
-app:
-  name: flask-app
-  runtime: python
+> **Status: proposed (not yet implemented).** Captured here to keep the single-file design honest about where it's going.
 
-environment:
-  FLASK_ENV: production
-  PORT: 8000
+### Problem
 
-build:
-  commands:
-    - pip install -r requirements.txt
+Operating Kata over SSH today is awkward for **individual containers**, especially under **Swarm**:
 
-services:
-  web:
-    command: gunicorn app:app --bind 0.0.0.0:$PORT
-    restart: always
-```
+- `restart` only restarts the **whole app** (stop + start). There is no per-service restart.
+- `run <service> <cmd>` and `ps` assume the caller already knows the exact container/service name.
+- Swarm assigns **random task/container names** (`<stack>_<service>.<slot>.<id>`), so a human over SSH cannot easily guess the name to target.
+- `ls` only reports app-level running state (matches `‹app›-*`), not per-service container identity.
 
-### Simple Python Web Application with Caddy
-```yaml
-version: "1.0"
+### Goals
 
-app:
-  name: flask-app
-  runtime: python
+1. **Autodetect** the concrete container(s) backing an `(app, service)` pair in both modes:
+   - Compose: containers labeled `com.docker.compose.project=<app>` / `…compose.service=<service>`
+   - Swarm: tasks/containers labeled `com.docker.stack.namespace=<app>` and `com.docker.swarm.service.name=<app>_<service>`, including replicas across nodes
+2. **Per-service restart** that does the right thing per mode:
+   - Compose: `docker compose -f … restart <service>` (or `up -d` for the single service)
+   - Swarm: `docker service update --force <app>_<service>` (rolling restart without re-deploying the stack)
+3. **Discoverability**: list services/containers for an app so an SSH user can pick a target without knowing random names.
+4. Keep everything **single-file** and dependency-free (shell out to `docker`, parse `--format` output).
 
-environment:
-  FLASK_ENV: production
-  PORT: 8000
+### Proposed CLI surface
 
-build:
-  commands:
-    - pip install -r requirements.txt
+| Command | Behavior |
+|---------|----------|
+| `restart <app> [service…]` | No service → whole-app restart (current behavior). One or more services → per-service restart, mode-aware. |
+| `services <app>` | List logical services for an app with desired/running replica counts and mode (wraps `docker stack services` / `compose ps --services`). |
+| `containers <app> [service]` | Resolve and print concrete container IDs/names/nodes for an app or one service (the autodetect primitive). |
+| `run <app> <service> [--index N] <cmd…>` | Resolve the container for `(app, service)` (first/replica `N`) and `docker exec` into it — no manual container name needed. |
 
-services:
-  web:
-    command: gunicorn app:app --bind 127.0.0.1:$PORT
-    restart: always
+Notes:
 
-caddy:
-  routes:
-    - match:
-        - host: ["flask.example.com"]
-      handle:
-        - handler: reverse_proxy
-          upstreams:
-            - dial: ":$PORT"
-  https:
-    enabled: true
-    redirect: true
-    domains: ["flask.example.com"]
-```
+- `run` would change from taking a raw container name to taking `(app, service)` and resolving it; the raw-name form can remain as a fallback.
+- Resolution helper (e.g. `resolve_containers(app, service=None) -> list[ContainerRef]`) becomes the shared primitive for `run`, `restart <service>`, `containers`, and `ps`.
+- Under Swarm, prefer `docker service update --force` for restarts (cluster-aware, rolling) over killing individual task containers; reserve container-level `exec` for `run`/debugging.
+- All resolution should be label-based (stable) rather than name-prefix matching, to survive Swarm's random task IDs.
 
-### Multi-Service Microservices Application
-```yaml
-version: "1.0"
+### Out of scope (for now)
 
-app:
-  name: microservices-app
-
-environment:
-  DATABASE_URL: postgresql://user:pass@db:5432/app
-  REDIS_URL: redis://redis:6379
-
-services:
-  web:
-    image: nginx:alpine
-    ports:
-      - "8080:80"
-    volumes:
-      - "./nginx.conf:/etc/nginx/nginx.conf"
-    depends_on:
-      - api
-
-  api:
-    command: node server.js
-    instances: 3
-    environment:
-      NODE_ENV: production
-    healthcheck:
-      path: /api/health
-    depends_on:
-      - db
-      - redis
-
-  db:
-    image: postgres:15
-    volumes:
-      - "db_data:/var/lib/postgresql/data"
-    environment:
-      POSTGRES_DB: app
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-
-  redis:
-    image: redis:7-alpine
-
-  worker:
-    command: node worker.js
-    instances: 2
-    depends_on:
-      - redis
-      - db
-
-volumes:
-  db_data:
-
-caddy:
-  routes:
-    - match:
-        - host: ["api.example.com"]
-      handle:
-        - handler: reverse_proxy
-          upstreams:
-            - dial: "api:3000"
-    - match:
-        - host: ["example.com"]
-      handle:
-        - handler: reverse_proxy
-          upstreams:
-            - dial: "web:80"
-  https:
-    enabled: true
-    domains: ["example.com", "api.example.com"]
-```
-
-### Static Site with Build Process
-```yaml
-version: "1.0"
-
-app:
-  name: static-site
-  runtime: static
-
-build:
-  commands:
-    - npm install
-    - npm run build
-
-services:
-  static:
-    type: static
-    root: ./dist
-
-caddy:
-  routes:
-    - match:
-        - host: ["example.com"]
-      handle:
-        - handler: vars
-          root: "$HOST_APP_ROOT/dist"
-        - handler: file_server
-          match:
-            - path: ["/assets/*"]
-          root: "{http.vars.root}"
-          headers:
-            response:
-              set:
-                Cache-Control: ["public, max-age=31536000"]
-        - handler: file_server
-          root: "{http.vars.root}"
-          index_names: ["index.html"]
-          try_files: ["{path}", "/index.html"]
-  https:
-    enabled: true
-    redirect: true
-```
-
-### Container-Based Application with Custom Networks
-```yaml
-version: "1.0"
-
-app:
-  name: container-app
-
-services:
-  app:
-    image: myapp:latest
-    instances: 2
-    ports:
-      - "8000:8000"
-    networks:
-      - app_network
-    environment:
-      DATABASE_URL: postgresql://db:5432/app
-    depends_on:
-      - db
-
-  db:
-    image: postgres:15
-    networks:
-      - app_network
-    volumes:
-      - "postgres_data:/var/lib/postgresql/data"
-    environment:
-      POSTGRES_DB: app
-
-volumes:
-  postgres_data:
-
-networks:
-  app_network:
-    driver: bridge
-
-caddy:
-  routes:
-    - handle:
-        - handler: reverse_proxy
-          upstreams:
-            - dial: "app:8000"
-  https:
-    enabled: true
-```
-
-## Limitations (Current Implementation)
-
-* Single-host focus (Swarm optional but used minimally)
-* No horizontal scaling flags (`instances`) or healthcheck synthesis
-* No build pipeline abstraction; you provide ready-to-run code / image
-* No systemd / Podman integration (Docker only)
-* No scheduled jobs / timers
-* No integrated log rotation or log viewing commands
-* Caddy integration limited to injecting supplied server object (no templating / multi-env layering)
-
-## Planned / Roadmap (Focused)
-
-Near‑term priorities only (longer speculative list removed):
-1. Additional runtimes (Go, Rust, static) via `runtime:` images
-2. Basic scaling & healthcheck fields mapped to Swarm / Compose
-3. Log tail / follow helper (`kata logs <app> [service]`)
-4. Config mutation commands (`config:set|unset`) with persistence
-5. Optional HTTP→HTTPS redirect helper in Caddy injection
+Multi-node SSH fan-out, log streaming aggregation, and replica scaling commands remain non-goals; Swarm handles scheduling natively.
 
 ---
 
 This document should be updated alongside code changes; discrepancies mean the code is authoritative.
-
