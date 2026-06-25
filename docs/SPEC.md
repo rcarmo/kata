@@ -163,8 +163,11 @@ echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/
 | `traefik:ls <app>` | List routers/services for the stack |
 | `traefik:inspect <app>` | Show labels per service |
 | `traefik:dashboard [--port/--bind/--web/--websecure/--off/--replace]` | Restart shared Traefik with/without dashboard |
-| `restart <app>` | Stop then start the whole app |
+| `restart <app> [service…]` | Whole-app restart, or per-service (mode-aware); `--logs/-l` follows service logs |
 | `stop <app>` | Stop the app (stack rm / compose down) |
+| `services <app>` | List an app's services (mode-aware) |
+| `containers <app> [service]` | Resolve concrete container IDs/names (label-based) |
+| `logs <app> [service] [-f] [--tail N]` | Tail app/service logs (mode-aware) |
 | `rm <app> [--force] [--wipe]` | Remove app; `--wipe` also deletes data/config (root-container wipe of bind mounts) |
 | `mode <app> [compose\|swarm]` | Get/set deploy mode (restarts on change) |
 | `secrets:set\|ls\|rm` | Manage Swarm secrets (Swarm only) |
@@ -172,7 +175,7 @@ echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/
 | `docker …` | Passthrough to `docker` |
 | `docker:services <stack>` | `docker stack services` |
 | `ps <app> [service…]` | Tasks for an app/services (Swarm `service ps`, else `compose ps`) |
-| `run <service> <cmd…>` | `docker exec -ti <service> <cmd>` |
+| `run <app> <service> [--index N] <cmd…>` | Autodetect the container and `docker exec -ti` into it |
 | `scp …` | Passthrough to `scp` |
 | `update` | Self-update `kata.py` from the raw GitHub source (writes `.backup`) |
 | `help` | Show CLI help |
@@ -200,49 +203,52 @@ echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/
 
 ---
 
-## Design Direction: SSH-friendly per-container operations
+## SSH-friendly per-container operations
 
-> **Status: proposed (not yet implemented).** Captured here to keep the single-file design honest about where it's going.
+> **Status: implemented.**
 
 ### Problem
 
-Operating Kata over SSH today is awkward for **individual containers**, especially under **Swarm**:
+Operating Kata over SSH for **individual containers** was awkward, especially under **Swarm**, which assigns **random task/container names** (`<stack>_<service>.<slot>.<id>`). A common manual workaround was:
 
-- `restart` only restarts the **whole app** (stop + start). There is no per-service restart.
-- `run <service> <cmd>` and `ps` assume the caller already knows the exact container/service name.
-- Swarm assigns **random task/container names** (`<stack>_<service>.<slot>.<id>`), so a human over SSH cannot easily guess the name to target.
-- `ls` only reports app-level running state (matches `‹app›-*`), not per-service container identity.
+```makefile
+deploy: deploy-production
+	ssh -t kata@$(PRODUCTION_SERVER) docker service update --force $(APP_NAME)_builder
+	ssh -t kata@$(PRODUCTION_SERVER) docker service logs --tail 0 -f $(APP_NAME)_builder
+```
 
-### Goals
+That now collapses to one line:
 
-1. **Autodetect** the concrete container(s) backing an `(app, service)` pair in both modes:
-   - Compose: containers labeled `com.docker.compose.project=<app>` / `…compose.service=<service>`
-   - Swarm: tasks/containers labeled `com.docker.stack.namespace=<app>` and `com.docker.swarm.service.name=<app>_<service>`, including replicas across nodes
-2. **Per-service restart** that does the right thing per mode:
-   - Compose: `docker compose -f … restart <service>` (or `up -d` for the single service)
-   - Swarm: `docker service update --force <app>_<service>` (rolling restart without re-deploying the stack)
-3. **Discoverability**: list services/containers for an app so an SSH user can pick a target without knowing random names.
-4. Keep everything **single-file** and dependency-free (shell out to `docker`, parse `--format` output).
+```makefile
+deploy: deploy-production
+	ssh -t kata@$(PRODUCTION_SERVER) kata restart $(APP_NAME) builder --logs
+```
 
-### Proposed CLI surface
+### Resolution primitive
+
+`resolve_containers(app, service=None) -> list[{id, name, status}]` resolves the concrete local containers backing an `(app[, service])` pair using **Docker labels** (not name-prefix matching), so it survives Swarm's random task IDs:
+
+- Compose: `com.docker.compose.project=<app>` (+ `com.docker.compose.service=<service>`)
+- Swarm: `com.docker.stack.namespace=<app>` (+ `com.docker.swarm.service.name=<app>_<service>`)
+
+This primitive backs `run` and `containers`.
+
+### CLI surface
 
 | Command | Behavior |
 |---------|----------|
-| `restart <app> [service…]` | No service → whole-app restart (current behavior). One or more services → per-service restart, mode-aware. |
-| `services <app>` | List logical services for an app with desired/running replica counts and mode (wraps `docker stack services` / `compose ps --services`). |
-| `containers <app> [service]` | Resolve and print concrete container IDs/names/nodes for an app or one service (the autodetect primitive). |
-| `run <app> <service> [--index N] <cmd…>` | Resolve the container for `(app, service)` (first/replica `N`) and `docker exec` into it — no manual container name needed. |
+| `restart <app>` | Whole-app restart (stop + start), as before. |
+| `restart <app> <service...> [--logs]` | Per-service restart: Swarm → `docker service update --force <app>_<service>` (rolling); Compose → `docker compose restart <service...>`. `--logs/-l` follows the last service's logs afterward. |
+| `services <app>` | List logical services for an app (Swarm `stack services`, else `compose ps`). |
+| `containers <app> [service]` | Resolve and print concrete container IDs/names/status (the autodetect primitive). |
+| `logs <app> [service]` | Tail logs, mode-aware (`-f/--follow`, `--tail`). Swarm requires a service; Compose accepts app-wide or per-service. |
+| `run <app> <service> [--index N] <cmd...>` | Resolve the container for `(app, service)` (replica `N`) and `docker exec -ti` into it. Falls back to treating `service` as a literal container name when nothing resolves. |
 
-Notes:
-
-- `run` would change from taking a raw container name to taking `(app, service)` and resolving it; the raw-name form can remain as a fallback.
-- Resolution helper (e.g. `resolve_containers(app, service=None) -> list[ContainerRef]`) becomes the shared primitive for `run`, `restart <service>`, `containers`, and `ps`.
-- Under Swarm, prefer `docker service update --force` for restarts (cluster-aware, rolling) over killing individual task containers; reserve container-level `exec` for `run`/debugging.
-- All resolution should be label-based (stable) rather than name-prefix matching, to survive Swarm's random task IDs.
+Under Swarm, restarts use `docker service update --force` (cluster-aware, rolling) rather than killing individual task containers; container-level `exec` is reserved for `run`/debugging.
 
 ### Out of scope (for now)
 
-Multi-node SSH fan-out, log streaming aggregation, and replica scaling commands remain non-goals; Swarm handles scheduling natively.
+Multi-node SSH fan-out, log aggregation, and replica scaling commands remain non-goals; Swarm handles scheduling natively.
 
 ---
 

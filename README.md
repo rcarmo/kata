@@ -238,8 +238,12 @@ Selected commands (run `kata help` for full output):
 | ---------------------------- | ------------------------------------- |
 | setup                        | Create root directories               |
 | ls                           | List apps & running state             |
-| restart / stop / rm          | Lifecycle management                  |
+| restart                      | Restart whole app, or `restart <app> <service...>` (mode-aware) |
+| stop / rm                    | Lifecycle management                  |
 | mode                         | Get/set deploy mode                   |
+| services <app>               | List an app's services (mode-aware)   |
+| containers <app> [service]   | Resolve concrete container IDs/names (label-based) |
+| logs <app> [service]         | Tail logs (mode-aware; `-f`, `--tail`) |
 | config:stack                 | Show original `kata-compose.yaml`     |
 | config:docker                | Show generated `.docker-compose.yaml` |
 | config:traefik               | Show generated Traefik labels/config  |
@@ -247,7 +251,7 @@ Selected commands (run `kata help` for full output):
 | secrets:\*                   | Manage Swarm secrets                  |
 | docker ...                   | Passthrough to `docker`               |
 | docker:services / ps         | Inspect Swarm/Compose processes       |
-| run <service> <cmd...>       | Exec into a running container         |
+| run <app> <service> <cmd...> | Autodetect the container and exec into it |
 | update                       | (WIP) self‑update script              |
 
 ---

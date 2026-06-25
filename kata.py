@@ -888,6 +888,72 @@ def require_swarm_or_warn() -> bool:
         return False
     return True
 
+
+def resolve_containers(app: str, service: str = None) -> list:
+    """Resolve concrete local containers backing an (app[, service]).
+
+    Label-based (not name-prefix) so it survives Swarm's random task names.
+    Works for both Compose and Swarm containers running on the local node.
+    Returns a list of {'id', 'name', 'status'} dicts.
+    """
+    app = sanitize_app_name(app)
+    mode = get_app_mode(app)
+    filters = []
+    if mode == 'swarm':
+        filters.append(f"label=com.docker.stack.namespace={app}")
+        if service:
+            filters.append(f"label=com.docker.swarm.service.name={app}_{service}")
+    else:
+        filters.append(f"label=com.docker.compose.project={app}")
+        if service:
+            filters.append(f"label=com.docker.compose.service={service}")
+    cmd = ['docker', 'ps', '--no-trunc', '--format', '{{.ID}}\t{{.Names}}\t{{.Status}}']
+    for f in filters:
+        cmd += ['--filter', f]
+    try:
+        out = check_output(cmd, universal_newlines=True).strip()
+    except Exception as exc:
+        echo(f"Error resolving containers: {exc}", fg='red')
+        return []
+    refs = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split('\t')
+        refs.append({
+            'id': parts[0] if len(parts) > 0 else '',
+            'name': parts[1] if len(parts) > 1 else '',
+            'status': parts[2] if len(parts) > 2 else '',
+        })
+    return refs
+
+
+def do_restart_services(app, services):
+    """Mode-aware restart of individual services.
+
+    Swarm: rolling 'docker service update --force <app>_<service>'.
+    Compose: 'docker compose restart <service...>'.
+    """
+    mode = get_app_mode(app)
+    app_path = join(APP_ROOT, app)
+    compose_path = join(app_path, DOCKER_COMPOSE)
+    if mode == 'swarm':
+        if not docker_is_swarm_manager():
+            echo("Error: Docker Swarm manager not available on this node.", fg='red')
+            return
+        for s in services:
+            target = f"{app}_{s}"
+            echo(f"-----> Rolling restart of service '{target}'", fg='yellow')
+            call(['docker', 'service', 'update', '--force', target],
+                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    else:
+        if not exists(compose_path):
+            echo(f"Error: compose file not found for app '{app}' at {compose_path}", fg='red')
+            return
+        echo(f"-----> Restarting service(s) {', '.join(services)}", fg='yellow')
+        call(get_compose_cmd() + ['-f', compose_path, 'restart'] + list(services),
+             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+
 # Basic deployment functions
 
 def do_deploy(app, deltas={}, newrev=None):
@@ -1435,20 +1501,115 @@ def cmd_service_ps(service):
 
 
 @command('run')
-@argument('service', required=True)
+@option('--index', default=0, show_default=True,
+        help='Replica index when a service has multiple containers.')
+@argument('app')
+@argument('service')
 @argument('command', nargs=-1, required=True)
-def cmd_run(service, command):
-    """Run a command inside a service"""
-    call(['docker', 'exec', '-ti', service] + list(command),
+def cmd_run(index, app, service, command):
+    """Run a command inside a container backing <app> <service>"""
+    app = exit_if_invalid(app)
+    refs = resolve_containers(app, service)
+    if not refs:
+        # Fallback: treat 'service' as a literal container/service name
+        echo(f"No resolved container for '{app}/{service}', trying literal name '{service}'...", fg='yellow')
+        target = service
+    else:
+        if index < 0 or index >= len(refs):
+            echo(f"Error: index {index} out of range (found {len(refs)} container(s))", fg='red')
+            return
+        target = refs[index]['id']
+        echo(f"-----> exec into {refs[index]['name']} ({target[:12]})", fg='green')
+    call(['docker', 'exec', '-ti', target] + list(command),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
-@command('restart')
+@command('services')
 @argument('app')
-def cmd_restart(app):
-    """Restart an app"""
+def cmd_app_services(app):
+    """List services for an app (mode-aware)"""
     app = exit_if_invalid(app)
-    do_restart(app)
+    mode = get_app_mode(app)
+    if mode == 'swarm':
+        call(['docker', 'stack', 'services', app],
+             stdout=stdout, stderr=stderr, universal_newlines=True)
+    else:
+        compose_path = join(APP_ROOT, app, DOCKER_COMPOSE)
+        if not exists(compose_path):
+            echo(f"Error: compose file not found for app '{app}' at {compose_path}", fg='red')
+            return
+        call(get_compose_cmd() + ['-f', compose_path, 'ps'],
+             stdout=stdout, stderr=stderr, universal_newlines=True)
+
+
+@command('containers')
+@argument('app')
+@argument('service', required=False)
+def cmd_containers(app, service=None):
+    """Resolve concrete container IDs/names for an app or one service"""
+    app = exit_if_invalid(app)
+    refs = resolve_containers(app, service)
+    if not refs:
+        suffix = f" service '{service}'" if service else ""
+        echo(f"No running containers found for '{app}'{suffix}", fg='yellow')
+        return
+    for r in refs:
+        echo(f"{r['id'][:12]}  {r['name']}  ({r['status']})", fg='white')
+
+
+@command('logs')
+@option('--follow', '-f', is_flag=True, default=False, help='Follow log output.')
+@option('--tail', default='100', show_default=True, help='Number of lines to show from the end ("all" for everything).')
+@argument('app')
+@argument('service', required=False)
+def cmd_logs(follow, tail, app, service=None):
+    """Tail logs for an app or one service (mode-aware)"""
+    app = exit_if_invalid(app)
+    mode = get_app_mode(app)
+    if mode == 'swarm':
+        if not service:
+            echo("Error: in swarm mode a service name is required: kata logs <app> <service>", fg='red')
+            return
+        cmd = ['docker', 'service', 'logs', '--tail', str(tail)]
+        if follow:
+            cmd.append('-f')
+        cmd.append(f"{app}_{service}")
+    else:
+        compose_path = join(APP_ROOT, app, DOCKER_COMPOSE)
+        if not exists(compose_path):
+            echo(f"Error: compose file not found for app '{app}' at {compose_path}", fg='red')
+            return
+        cmd = get_compose_cmd() + ['-f', compose_path, 'logs', '--tail', str(tail)]
+        if follow:
+            cmd.append('-f')
+        if service:
+            cmd.append(service)
+    call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
+
+
+@command('restart')
+@option('--logs', '-l', 'show_logs', is_flag=True, default=False,
+        help='Follow service logs after restarting (per-service restarts only).')
+@argument('app')
+@argument('service', nargs=-1, required=False)
+def cmd_restart(show_logs, app, service):
+    """Restart an app, or individual services: restart <app> [service...]"""
+    app = exit_if_invalid(app)
+    if service:
+        do_restart_services(app, list(service))
+        if show_logs:
+            mode = get_app_mode(app)
+            last = service[-1]
+            echo(f"-----> Following logs for '{last}' (Ctrl-C to stop)", fg='green')
+            if mode == 'swarm':
+                call(['docker', 'service', 'logs', '--tail', '0', '-f', f"{app}_{last}"],
+                     stdout=stdout, stderr=stderr, universal_newlines=True)
+            else:
+                compose_path = join(APP_ROOT, app, DOCKER_COMPOSE)
+                call(get_compose_cmd() + ['-f', compose_path, 'logs', '--tail', '0', '-f', last],
+                     stdout=stdout, stderr=stderr, universal_newlines=True)
+    else:
+        do_restart(app)
 
 
 @command('mode')
