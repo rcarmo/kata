@@ -252,7 +252,7 @@ Selected commands (run `kata help` for full output):
 | docker ...                   | Passthrough to `docker`               |
 | docker:services / ps         | Inspect Swarm/Compose processes       |
 | run <app> <service> <cmd...> | Autodetect the container and exec into it |
-| update                       | (WIP) self‑update script              |
+| update                       | Self‑update `kata.py` from upstream (validates, backs up, re-execs) |
 
 ---
 

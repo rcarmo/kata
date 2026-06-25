@@ -177,7 +177,7 @@ echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/
 | `ps <app> [service…]` | Tasks for an app/services (Swarm `service ps`, else `compose ps`) |
 | `run <app> <service> [--index N] <cmd…>` | Autodetect the container and `docker exec -ti` into it |
 | `scp …` | Passthrough to `scp` |
-| `update` | Self-update `kata.py` from the raw GitHub source (writes `.backup`) |
+| `update [--force] [--no-restart]` | Self-update `kata.py` from upstream: follows redirects, validates the download compiles, writes a `.backup`, replaces atomically, and re-execs |
 | `help` | Show CLI help |
 | `git-hook` / `git-receive-pack` / `git-upload-pack` | Internal (hidden) |
 

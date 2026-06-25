@@ -16,7 +16,7 @@ from re import sub
 from shutil import copyfile, rmtree, which
 from stat import S_IRUSR, S_IWUSR, S_IXUSR
 from subprocess import STDOUT, call, check_output, run
-from sys import argv, stderr, stdin, stdout
+from sys import argv, executable, stderr, stdin, stdout
 from tempfile import NamedTemporaryFile
 from traceback import format_exc
 from urllib.parse import urlparse
@@ -143,6 +143,38 @@ RUNTIME_IMAGES = {
     'kata/bun': BUN_DOCKERFILE,
     'kata/static': STATIC_DOCKERFILE
 }
+
+
+def _http_get(url: str, max_redirects: int = 5) -> str:
+    """Minimal HTTPS GET that follows redirects (e.g. github raw -> raw.githubusercontent).
+    Returns the response body as text. Raises on non-2xx."""
+    for _ in range(max_redirects + 1):
+        parsed = urlparse(url)
+        if parsed.scheme != 'https':
+            raise ValueError(f"refusing non-https URL: {url}")
+        conn = HTTPSConnection(parsed.netloc, timeout=30)
+        path = parsed.path or '/'
+        if parsed.query:
+            path += '?' + parsed.query
+        conn.request('GET', path, headers={'User-Agent': 'kata-update', 'Accept': '*/*'})
+        resp = conn.getresponse()
+        if resp.status in (301, 302, 303, 307, 308):
+            location = resp.getheader('Location')
+            resp.read()
+            conn.close()
+            if not location:
+                raise RuntimeError(f"redirect ({resp.status}) without Location header")
+            # Resolve relative redirects against the current URL
+            if location.startswith('/'):
+                location = f"{parsed.scheme}://{parsed.netloc}{location}"
+            url = location
+            continue
+        body = resp.read().decode('utf-8')
+        conn.close()
+        if 200 <= resp.status < 300:
+            return body
+        raise RuntimeError(f"HTTP {resp.status} for {url}")
+    raise RuntimeError("too many redirects")
 
 
 def traefik_is_running() -> bool:
@@ -1682,35 +1714,68 @@ def cmd_setup_ssh(public_key_file):
 
 
 @command('update')
-def cmd_update():
-    """Update kata to the latest version"""
-    try:
-        # Download the latest version
-        echo("Downloading latest version...", fg='green')
-        parsed = urlparse(KATA_RAW_SOURCE_URL)
-        conn = HTTPSConnection(parsed.netloc)
-        conn.request('GET', parsed.path)
-        resp = conn.getresponse()
+@option('--force', '-f', is_flag=True, default=False, help='Reinstall even if already up to date.')
+@option('--no-restart', is_flag=True, default=False, help='Do not re-exec kata after updating.')
+def cmd_update(force, no_restart):
+    """Update kata.py in place from the upstream source"""
+    from os import execv, replace
 
-        if resp.status == 200:
-            body = resp.read().decode('utf-8')
-            # Create a backup of the current script
-            backup_file = f"{KATA_SCRIPT}.backup"
-            copyfile(KATA_SCRIPT, backup_file)
-            echo(f"Created backup at {backup_file}", fg='green')
-            # Write the new version
-            with open(KATA_SCRIPT, 'w', encoding='utf-8') as f:
-                f.write(body)
-            # Make it executable
-            chmod(KATA_SCRIPT, S_IRUSR | S_IWUSR | S_IXUSR)
-            echo("Update complete! Restart any running kata processes.", fg='green')
-        else:
-            echo(f"Failed to download update: HTTP {resp.status}", fg='red')
-    except ImportError:
-        echo("Error: requests module not installed", fg='red')
-        echo("Install it with: pip install requests", fg='yellow')
+    echo(f"-----> Fetching latest kata from {KATA_RAW_SOURCE_URL}", fg='green')
+    try:
+        body = _http_get(KATA_RAW_SOURCE_URL)
     except Exception as e:
-        echo(f"Error updating kata: {str(e)}", fg='red')
+        echo(f"Error: download failed: {e}", fg='red')
+        return
+
+    if not body or not body.lstrip().startswith('#!'):
+        echo("Error: downloaded content does not look like a kata.py script; aborting.", fg='red')
+        return
+
+    # Validate it actually compiles before we overwrite anything.
+    try:
+        compile(body, '<kata-update>', 'exec')
+    except SyntaxError as e:
+        echo(f"Error: downloaded kata.py failed to compile ({e}); aborting.", fg='red')
+        return
+
+    try:
+        current = open(KATA_SCRIPT, 'r', encoding='utf-8').read()
+    except Exception:
+        current = None
+    if current is not None and body == current and not force:
+        echo("Already up to date.", fg='green')
+        return
+
+    backup_file = f"{KATA_SCRIPT}.backup"
+    try:
+        copyfile(KATA_SCRIPT, backup_file)
+        echo(f"-----> Backed up current version to {backup_file}", fg='yellow')
+    except Exception as e:
+        echo(f"Warning: could not create backup: {e}", fg='yellow')
+
+    # Write atomically: temp file in the same dir, then replace().
+    try:
+        tmp = f"{KATA_SCRIPT}.new"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(body)
+        chmod(tmp, S_IRUSR | S_IWUSR | S_IXUSR)
+        replace(tmp, KATA_SCRIPT)
+    except Exception as e:
+        echo(f"Error: failed to write update: {e}", fg='red')
+        echo(f"Your previous version is preserved at {backup_file}", fg='yellow')
+        return
+
+    echo("Update complete.", fg='green')
+    if no_restart:
+        echo("Restart any running kata processes to pick up the new version.", fg='yellow')
+        return
+    # Re-exec so the running invocation reflects the new code.
+    try:
+        echo("-----> Re-executing updated kata...", fg='green')
+        execv(executable, [executable, KATA_SCRIPT, '--help'])
+    except Exception:
+        echo("Updated; please re-run your command.", fg='yellow')
+
 
 # === Internal commands ===
 
