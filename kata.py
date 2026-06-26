@@ -1077,11 +1077,41 @@ def do_remove(app, wipe: bool = False):
                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
+def wait_stack_removed(app, timeout: int = 60) -> bool:
+    """Wait for a Swarm stack's services and networks to be fully removed.
+
+    'docker stack rm' is asynchronous: services and the overlay network are torn
+    down in the background. Redeploying too soon fails with errors like
+    'network <app>_default not found'. Poll until nothing remains.
+    """
+    from time import sleep, monotonic
+    deadline = monotonic() + timeout
+    ns_filter = f"label=com.docker.stack.namespace={app}"
+    while monotonic() < deadline:
+        try:
+            services = check_output(['docker', 'service', 'ls', '--quiet', '--filter', ns_filter],
+                                    universal_newlines=True).strip()
+            # Networks don't reliably carry the stack label; match by name.
+            networks = check_output(['docker', 'network', 'ls', '--quiet', '--filter', f"name={app}_"],
+                                    universal_newlines=True).strip()
+        except Exception:
+            return True
+        if not services and not networks:
+            return True
+        sleep(1)
+    echo(f"Warning: stack '{app}' did not fully drain within {timeout}s; proceeding anyway.", fg='yellow')
+    return False
+
+
 def do_restart(app):
     """Restarts a deployed app"""
     do_stop(app)
+    # In Swarm mode, 'stack rm' is async; wait for services/networks to clear
+    # before redeploying to avoid 'network <app>_default not found' races.
+    if get_app_mode(app) == 'swarm':
+        echo(f"-----> Waiting for stack '{app}' to drain...", fg='yellow')
+        wait_stack_removed(app)
     do_start(app)
-    pass
 
 # === CLI Commands ===
 
