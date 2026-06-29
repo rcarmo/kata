@@ -37,8 +37,27 @@ class SwarmDrainTests(unittest.TestCase):
 
     def test_wait_stack_removed_returns_false_when_resources_remain(self):
         with patch.object(kata, "check_output", return_value="still-there"), \
-             patch("time.sleep", return_value=None):
+             patch("time.sleep", return_value=None), \
+             patch.object(kata, "echo"):
             self.assertFalse(kata.wait_stack_removed("app", timeout=0))
+
+
+class LifecycleErrorHandlingTests(unittest.TestCase):
+    def test_restart_stops_when_stop_fails(self):
+        with patch.object(kata, "get_app_mode", return_value="compose"), \
+             patch.object(kata, "do_stop", return_value=False), \
+             patch.object(kata, "do_start") as do_start:
+            self.assertFalse(kata.do_restart("app"))
+            do_start.assert_not_called()
+
+    def test_restart_stops_when_swarm_drain_fails(self):
+        with patch.object(kata, "get_app_mode", return_value="swarm"), \
+             patch.object(kata, "do_stop", return_value=True), \
+             patch.object(kata, "wait_stack_removed", return_value=False), \
+             patch.object(kata, "echo"), \
+             patch.object(kata, "do_start") as do_start:
+            self.assertFalse(kata.do_restart("app"))
+            do_start.assert_not_called()
 
 
 if __name__ == "__main__":

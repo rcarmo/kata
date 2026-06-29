@@ -516,6 +516,19 @@ def echo(message, fg=None, nl=True, err=False) -> None:
     click_echo(message, color=True if fg else None, nl=nl, err=err)
 
 
+def warn(message) -> None:
+    echo(f"Warning: {message}", fg='yellow')
+
+
+def error(message) -> None:
+    echo(f"Error: {message}", fg='red')
+
+
+def fatal(message, code: int = 1):
+    error(message)
+    exit(code)
+
+
 def base_env(app, env=None) -> dict:
     """Get the environment variables for an app"""
     base = {'PGID': str(PGID), 'PUID': str(PUID)}
@@ -524,8 +537,7 @@ def base_env(app, env=None) -> dict:
             path_value = globals()[key]
             base[key] = join(path_value, app)
         except KeyError:
-            echo(f"Error: {key} not found in global variables", fg='red')
-            exit(1)
+            fatal(f"{key} not found in global variables")
     # If env is provided, update the base environment with it
     if env is not None:
         base.update(env)
@@ -658,7 +670,7 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
     image = f"kata/{runtime}"
     if not docker_check_image_exists(image) and not destroy:
         if not docker_create_runtime_image(image, RUNTIME_IMAGES[image]):
-            exit(1)
+            fatal(f"failed to create runtime image {image}")
     volumes = [
         "-v", f"{join(APP_ROOT, app_name)}:/app",
         "-v", f"{join(CONFIG_ROOT, app_name)}:/config",
@@ -706,8 +718,7 @@ def exit_if_invalid(app, deployed=False):
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
     if not exists(app_path):
-        echo(f"Error: app '{app}' not deployed!", fg='red')
-        exit(1)
+        fatal(f"app '{app}' not deployed!")
     return app
 
 
@@ -729,8 +740,7 @@ def parse_compose(app_name, filename) -> tuple:
         return None, None
 
     if data and 'caddy' in data:
-        echo("Error: 'caddy:' is no longer supported. Use Traefik labels (implicit) instead.", fg='red')
-        exit(1)
+        fatal("'caddy:' is no longer supported. Use Traefik labels (implicit) instead.")
 
     env = {}
     if "environment" in data:
@@ -764,8 +774,7 @@ def parse_compose(app_name, filename) -> tuple:
                 if service["image"] in RUNTIME_IMAGES:
                     docker_handle_runtime_environment(app_name, service["runtime"], env=env)
                 else:
-                    echo(f"Error: runtime '{service['runtime']}' not supported", fg='red')
-                    exit(1)
+                    fatal(f"runtime '{service['runtime']}' not supported")
                 del service["runtime"]
             if not "volumes" in service:
                 service["volumes"] = ["app:/app", "config:/config", "data:/data", "venv:/venv"]
@@ -915,7 +924,7 @@ def get_compose_cmd() -> list:
 def require_swarm_or_warn() -> bool:
     """Ensure Docker Swarm is active; print a helpful error if not."""
     if not docker_is_swarm_manager():
-        echo("Error: Docker Swarm manager not available on this node. This command requires a Swarm manager.", fg='red')
+        error("Docker Swarm manager not available on this node. This command requires a Swarm manager.")
         echo("Tip: Initialize Swarm with 'docker swarm init' or switch app mode to 'compose' where applicable.", fg='yellow')
         return False
     return True
@@ -969,7 +978,7 @@ def resolve_containers(app: str, service: str = None) -> list:
     return refs
 
 
-def do_restart_services(app, services):
+def do_restart_services(app, services) -> bool:
     """Mode-aware restart of individual services.
 
     Swarm: rolling 'docker service update --force <app>_<service>'.
@@ -980,24 +989,27 @@ def do_restart_services(app, services):
     compose_path = join(app_path, DOCKER_COMPOSE)
     if mode == 'swarm':
         if not docker_is_swarm_manager():
-            echo("Error: Docker Swarm manager not available on this node.", fg='red')
-            return
+            error("Docker Swarm manager not available on this node.")
+            return False
+        all_ok = True
         for s in services:
             target = f"{app}_{s}"
             echo(f"-----> Rolling restart of service '{target}'", fg='yellow')
-            call(['docker', 'service', 'update', '--force', target],
-                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
-    else:
-        if not exists(compose_path):
-            echo(f"Error: compose file not found for app '{app}' at {compose_path}", fg='red')
-            return
-        echo(f"-----> Restarting service(s) {', '.join(services)}", fg='yellow')
-        call(get_compose_cmd() + ['-f', compose_path, 'restart'] + list(services),
-             cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+            rc = call(['docker', 'service', 'update', '--force', target],
+                      cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+            all_ok = all_ok and rc == 0
+        return all_ok
+    if not exists(compose_path):
+        error(f"compose file not found for app '{app}' at {compose_path}")
+        return False
+    echo(f"-----> Restarting service(s) {', '.join(services)}", fg='yellow')
+    rc = call(get_compose_cmd() + ['-f', compose_path, 'restart'] + list(services),
+              cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    return rc == 0
 
 # Basic deployment functions
 
-def do_deploy(app, deltas={}, newrev=None):
+def do_deploy(app, deltas={}, newrev=None) -> bool:
     """Deploy an app by resetting the work directory"""
 
     app_path = join(APP_ROOT, app)
@@ -1014,8 +1026,8 @@ def do_deploy(app, deltas={}, newrev=None):
         ensure_shared_traefik()
         compose, traefik = parse_compose(app, compose_file)
         if not compose:
-            echo(f"Error: could not parse {compose_file}", fg='red')
-            return
+            error(f"could not parse {compose_file}")
+            return False
         with open(join(APP_ROOT, app, DOCKER_COMPOSE), "w", encoding='utf-8') as f:
             f.write(safe_dump(compose))
         # Record chosen mode for subsequent lifecycle ops
@@ -1024,66 +1036,73 @@ def do_deploy(app, deltas={}, newrev=None):
         if isinstance(cfg_override, dict) and cfg_override.get('x-kata-mode') in ('swarm', 'compose'):
             mode = cfg_override['x-kata-mode']
         set_app_mode(app, mode)
-        do_start(app)
+        return do_start(app)
+    error(f"app '{app}' not found.")
+    return False
+
+
+def do_start(app) -> bool:
+    app_path = join(APP_ROOT, app)
+    compose_path = join(app_path, DOCKER_COMPOSE)
+    if not exists(compose_path):
+        error(f"compose file not found for app '{app}' at {compose_path}")
+        return False
+    mode = get_app_mode(app)
+    echo(f"-----> Starting app '{app}' (mode: {mode})", fg='yellow')
+    if mode == 'swarm':
+        if not docker_is_swarm_manager():
+            error("Docker Swarm manager not available on this node; cannot deploy stack.")
+            echo("Tip: run 'docker swarm init' on a manager or switch this app to compose mode (kata mode <app> compose).", fg='yellow')
+            return False
+        rc = call(['docker', 'stack', 'deploy', app, f'--compose-file={compose_path}', '--detach=true', '--resolve-image=never', '--prune'],
+                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
     else:
-        echo(f"Error: app '{app}' not found.", fg='red')
+        rc = call(get_compose_cmd() + ['-f', compose_path, 'up', '-d', '--remove-orphans'],
+                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    return rc == 0
 
 
-def do_start(app):
+def do_stop(app) -> bool:
     app_path = join(APP_ROOT, app)
-    if exists(join(app_path, DOCKER_COMPOSE)):
-        mode = get_app_mode(app)
-        echo(f"-----> Starting app '{app}' (mode: {mode})", fg='yellow')
-        compose_path = join(app_path, DOCKER_COMPOSE)
-        if mode == 'swarm':
-            if not docker_is_swarm_manager():
-                echo("Error: Docker Swarm manager not available on this node; cannot deploy stack.", fg='red')
-                echo("Tip: run 'docker swarm init' on a manager or switch this app to compose mode (kata mode <app> compose).", fg='yellow')
-                return
-            call(['docker', 'stack', 'deploy', app, f'--compose-file={compose_path}', '--detach=true', '--resolve-image=never', '--prune'],
-                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
-        else:
-            # docker compose up -d
-            call(get_compose_cmd() + ['-f', compose_path, 'up', '-d', '--remove-orphans'],
-                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    compose_path = join(app_path, DOCKER_COMPOSE)
+    if not exists(compose_path):
+        error(f"compose file not found for app '{app}' at {compose_path}")
+        return False
+    mode = get_app_mode(app)
+    echo(f"-----> Stopping app '{app}' (mode: {mode})", fg='yellow')
+    if mode == 'swarm':
+        rc = call(['docker', 'stack', 'rm', app],
+                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    else:
+        rc = call(get_compose_cmd() + ['-f', compose_path, 'down', '--remove-orphans'],
+                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    return rc == 0
 
 
-def do_stop(app):
+def do_remove(app, wipe: bool = False) -> bool:
     app_path = join(APP_ROOT, app)
-    if exists(join(app_path, DOCKER_COMPOSE)):
-        mode = get_app_mode(app)
-        echo(f"-----> Stopping app '{app}' (mode: {mode})", fg='yellow')
-        compose_path = join(app_path, DOCKER_COMPOSE)
-        if mode == 'swarm':
-            call(['docker', 'stack', 'rm', app],
-                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
-        else:
-            call(get_compose_cmd() + ['-f', compose_path, 'down', '--remove-orphans'],
-                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
-
-
-def do_remove(app, wipe: bool = False):
-    app_path = join(APP_ROOT, app)
-    if exists(join(app_path, DOCKER_COMPOSE)):
-        yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
-        if 'services' in yaml:
-            for service_name, service in yaml['services'].items():
-                echo("---> Removing service: " + service_name, fg='yellow')
-                if 'runtime' in service:
-                    runtime = service['runtime']
-                    docker_handle_runtime_environment(app, runtime, destroy=True)
-        mode = get_app_mode(app)
-        echo(f"-----> Removing '{app}' (mode: {mode})", fg='yellow')
-        compose_path = join(app_path, DOCKER_COMPOSE)
-        if mode == 'swarm':
-            call(['docker', 'stack', 'rm', app],
-                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
-        else:
-            cmd = get_compose_cmd() + ['-f', compose_path, 'down', '--remove-orphans']
-            if wipe:
-                cmd.insert(-1, '--volumes')
-            call(cmd,
-                 cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    compose_path = join(app_path, DOCKER_COMPOSE)
+    if not exists(compose_path):
+        error(f"compose file not found for app '{app}' at {compose_path}")
+        return False
+    yaml = safe_load(open(join(app_path, KATA_COMPOSE), 'r', encoding='utf-8').read())
+    if 'services' in yaml:
+        for service_name, service in yaml['services'].items():
+            echo("---> Removing service: " + service_name, fg='yellow')
+            if 'runtime' in service:
+                runtime = service['runtime']
+                docker_handle_runtime_environment(app, runtime, destroy=True)
+    mode = get_app_mode(app)
+    echo(f"-----> Removing '{app}' (mode: {mode})", fg='yellow')
+    if mode == 'swarm':
+        rc = call(['docker', 'stack', 'rm', app],
+                  cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    else:
+        cmd = get_compose_cmd() + ['-f', compose_path, 'down', '--remove-orphans']
+        if wipe:
+            cmd.insert(-1, '--volumes')
+        rc = call(cmd, cwd=app_path, stdout=stdout, stderr=stderr, universal_newlines=True)
+    return rc == 0
 
 
 def wait_stack_removed(app, timeout: int = 60) -> bool:
@@ -1108,22 +1127,23 @@ def wait_stack_removed(app, timeout: int = 60) -> bool:
         if not services and not networks:
             return True
         sleep(1)
-    echo(f"Error: stack '{app}' did not fully drain within {timeout}s; aborting restart.", fg='red')
+    error(f"stack '{app}' did not fully drain within {timeout}s; aborting restart.")
     echo("Tip: inspect with 'docker service ls' and 'docker network ls', then retry.", fg='yellow')
     return False
 
 
-def do_restart(app):
+def do_restart(app) -> bool:
     """Restarts a deployed app"""
     mode = get_app_mode(app)
-    do_stop(app)
+    if not do_stop(app):
+        return False
     # In Swarm mode, 'stack rm' is async; wait for services/networks to clear
     # before redeploying to avoid 'network <app>_default not found' races.
     if mode == 'swarm':
         echo(f"-----> Waiting for stack '{app}' to drain...", fg='yellow')
         if not wait_stack_removed(app):
-            return
-    do_start(app)
+            return False
+    return do_start(app)
 
 # === CLI Commands ===
 
@@ -1461,7 +1481,7 @@ def cmd_destroy(app, force, wipe):
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
     if not exists(app_path):
-        echo(f"Error: stack '{app}' not deployed!", fg='red')
+        error(f"stack '{app}' not deployed!")
         return
 
     if not force:
@@ -1470,7 +1490,8 @@ def cmd_destroy(app, force, wipe):
             echo("Aborted.", fg='yellow')
             return
 
-    do_remove(app, wipe=wipe)
+    if not do_remove(app, wipe=wipe):
+        return
 
     paths = [join(APP_ROOT, app), join(ENV_ROOT, app), join(LOG_ROOT, app), join(GIT_ROOT, app)]
     data_path = join(DATA_ROOT, app)
@@ -1677,7 +1698,8 @@ def cmd_restart(show_logs, app, service):
     """Restart an app, or individual services: restart <app> [service...]"""
     app = exit_if_invalid(app)
     if service:
-        do_restart_services(app, list(service))
+        if not do_restart_services(app, list(service)):
+            return
         if show_logs:
             mode = get_app_mode(app)
             last = service[-1]
