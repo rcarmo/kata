@@ -12,7 +12,7 @@ from http.client import HTTPSConnection
 from json import dumps
 from os import chmod, environ, getgid, getuid, listdir, makedirs, remove, stat
 from os.path import abspath, dirname, exists, join, realpath
-from re import sub
+from re import fullmatch, sub
 from shutil import copyfile, rmtree, which
 from stat import S_IRUSR, S_IWUSR, S_IXUSR
 from subprocess import STDOUT, call, check_output, run
@@ -921,6 +921,15 @@ def require_swarm_or_warn() -> bool:
     return True
 
 
+def is_valid_docker_name(name: str) -> bool:
+    """Return True for conservative Docker object names used by Kata.
+
+    Docker accepts a wider set in some contexts, but Kata intentionally keeps
+    user-facing object names simple to avoid ambiguity in CLI output and logs.
+    """
+    return bool(name and fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name))
+
+
 def resolve_containers(app: str, service: str = None) -> list:
     """Resolve concrete local containers backing an (app[, service]).
 
@@ -1099,18 +1108,21 @@ def wait_stack_removed(app, timeout: int = 60) -> bool:
         if not services and not networks:
             return True
         sleep(1)
-    echo(f"Warning: stack '{app}' did not fully drain within {timeout}s; proceeding anyway.", fg='yellow')
+    echo(f"Error: stack '{app}' did not fully drain within {timeout}s; aborting restart.", fg='red')
+    echo("Tip: inspect with 'docker service ls' and 'docker network ls', then retry.", fg='yellow')
     return False
 
 
 def do_restart(app):
     """Restarts a deployed app"""
+    mode = get_app_mode(app)
     do_stop(app)
     # In Swarm mode, 'stack rm' is async; wait for services/networks to clear
     # before redeploying to avoid 'network <app>_default not found' races.
-    if get_app_mode(app) == 'swarm':
+    if mode == 'swarm':
         echo(f"-----> Waiting for stack '{app}' to drain...", fg='yellow')
-        wait_stack_removed(app)
+        if not wait_stack_removed(app):
+            return
     do_start(app)
 
 # === CLI Commands ===
@@ -1217,6 +1229,10 @@ def cmd_secrets_set(secrets):
                 echo(f"Enter value for secret '{k}' (end with EOF / Ctrl-D):", fg='yellow')
                 content = stdin.read()
             
+            if not is_valid_docker_name(k):
+                echo(f"Error: invalid secret name '{k}'. Use letters, digits, '.', '_' or '-', starting with a letter or digit.", fg='red')
+                continue
+
             echo(f"Setting secret '{k}'", fg='white')
             run(['docker', 'secret', 'create', k, '-'], input=content,
                  stdout=stdout, stderr=stderr, universal_newlines=True, text=True, check=True)
@@ -1234,6 +1250,9 @@ def cmd_secrets_set(secrets):
 def cmd_secrets_rm(secret):
     """Remove a secret"""
     if not require_swarm_or_warn():
+        return
+    if not is_valid_docker_name(secret):
+        echo(f"Error: invalid secret name '{secret}'.", fg='red')
         return
     call(['docker', 'secret', 'rm', secret], stdout=stdout, stderr=stderr, universal_newlines=True)
 

@@ -170,7 +170,7 @@ echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/
 | `logs <app> [service] [-f] [--tail N]` | Tail app/service logs (mode-aware) |
 | `rm <app> [--force] [--wipe]` | Remove app; `--wipe` also deletes data/config (root-container wipe of bind mounts) |
 | `mode <app> [compose\|swarm]` | Get/set deploy mode (restarts on change) |
-| `secrets:set\|ls\|rm` | Manage Swarm secrets (Swarm only) |
+| `secrets:set\|ls\|rm` | Manage Swarm secrets (Swarm only; names are validated conservatively) |
 | `runtime:rebuild-all` / `runtime:rebuild <rt>` / `runtime:clean` | Manage runtime images |
 | `docker …` | Passthrough to `docker` |
 | `docker:services <stack>` | `docker stack services` |
@@ -188,6 +188,8 @@ echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/
 3. `ensure_shared_traefik()`
 4. `parse_compose`: merge env → build runtime image(s) if needed → apply Traefik labels → write `.docker-compose.yaml`
 5. Record mode (`x-kata-mode` overrides host autodetect) and `do_start` via Swarm or Compose
+
+For full-app restarts in Swarm mode, Kata waits for `docker stack rm` teardown to finish before redeploying. If services or stack networks do not drain within the timeout, restart aborts rather than redeploying into a half-removed stack.
 
 ## Security (Current)
 

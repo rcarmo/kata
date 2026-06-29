@@ -248,11 +248,19 @@ Selected commands (run `kata help` for full output):
 | config:docker                | Show generated `.docker-compose.yaml` |
 | config:traefik               | Show generated Traefik labels/config  |
 | traefik:ls / traefik:inspect | Inspect routers/services and labels   |
-| secrets:\*                   | Manage Swarm secrets                  |
+| secrets:\*                   | Manage Swarm secrets (validated names) |
 | docker ...                   | Passthrough to `docker`               |
 | docker:services / ps         | Inspect Swarm/Compose processes       |
 | run <app> <service> <cmd...> | Autodetect the container and exec into it |
 | update                       | Self‑update `kata.py` from upstream (validates, backs up, re-execs) |
+
+### Testing
+
+```bash
+make test
+```
+
+The test suite covers small, dependency-light helpers such as Docker object-name validation and Swarm stack-drain behavior.
 
 ---
 

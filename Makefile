@@ -5,8 +5,8 @@ export CURRENT_GIT_BRANCH?=`git symbolic-ref --short HEAD`
 
 .DEFAULT_GOAL := help
 
-test: ## Run local test
-	python kata.py 
+test: ## Run local tests
+	python -m unittest discover -s tests
 
 deploy-paas: ## Push to test
 	# POST entire kata.py to home server on port 8000
