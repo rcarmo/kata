@@ -255,3 +255,19 @@ Multi-node SSH fan-out, log aggregation, and replica scaling commands remain non
 ---
 
 This document should be updated alongside code changes; discrepancies mean the code is authoritative.
+
+## Audit hardening (September 2026)
+
+- Lifecycle CLI failures return non-zero where explicitly checked; broad subprocess
+  error propagation remains under review.
+- Mode changes stop and drain the old deployment before persisting the new mode.
+  A failed new start retains the selected mode for recovery, not automatic rollback.
+- Secret file/stdin bytes are preserved without lossy UTF-8 decoding. Names are
+  validated before input is read, and creation failures exit non-zero.
+- Git post-receive deployments hold an exclusive per-app `flock` on
+  `repos/<app>/kata-deploy.lock`, outside the resettable working tree. Deleted refs
+  are skipped; failed clone/fetch/reset/submodule commands stop deployment.
+  This lock serializes post-receive hooks, not all lifecycle commands.
+- Self-update uses a unique same-directory temporary file, preserves file permissions,
+  and requires a successful backup before replacement. Syntax validation is not
+  signature verification: the upstream repository remains a trusted code source.

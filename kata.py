@@ -903,8 +903,8 @@ def set_app_mode(app: str, mode: str):
     try:
         with open(join(app_path, KATA_MODE_FILE), 'w', encoding='utf-8') as f:
             f.write(mode)
-    except Exception:
-        pass
+    except OSError as exc:
+        fatal(f"could not persist deployment mode: {exc}")
 
 def get_compose_cmd() -> list:
     """Return the base compose command: ['docker','compose'] if available, else ['docker-compose']."""
@@ -1015,14 +1015,19 @@ def do_deploy(app, deltas={}, newrev=None) -> bool:
     app_path = join(APP_ROOT, app)
     compose_file = join(app_path, KATA_COMPOSE)
 
-    env = {'GIT_WORK_DIR': app_path}
     if exists(app_path):
         echo(f"-----> Deploying app '{app}'", fg='green')
-        call('git fetch --quiet', cwd=app_path, env=env, shell=True)
+        commands = [['git', 'fetch', '--quiet']]
         if newrev:
-            call(f'git reset --hard {newrev}', cwd=app_path, env=env, shell=True)
-        call('git submodule init', cwd=app_path, env=env, shell=True)
-        call('git submodule update', cwd=app_path, env=env, shell=True)
+            commands.append(['git', 'reset', '--hard', newrev])
+        commands.extend([['git', 'submodule', 'init'], ['git', 'submodule', 'update']])
+        # Receive hooks inherit Git repository selectors; do not let them
+        # redirect operations away from the app's working tree.
+        env = {k: v for k, v in environ.items() if not k.startswith('GIT_')}
+        for command_args in commands:
+            if call(command_args, cwd=app_path, env=env) != 0:
+                error("Git checkout preparation failed")
+                return False
         ensure_shared_traefik()
         compose, traefik = parse_compose(app, compose_file)
         if not compose:
@@ -1191,80 +1196,30 @@ def cmd_config(app):
 def cmd_secrets_set(secrets):
     """Set a docker secret: name=value, name=@filename, name=- (stdin), or just name (prompt)"""
     if not require_swarm_or_warn():
-        return
-    if not secrets:
-        k = input("Secret name: ")
-        echo("Enter secret value (end with EOF / Ctrl-D):", fg='yellow')
-        v = stdin.read().strip()
-        secrets = [f"{k}={v}"]
-    
-    for s in secrets:
+        fatal("secrets require a Swarm manager")
+    for item in secrets:
+        name, separator, value = item.partition('=')
+        if not is_valid_docker_name(name):
+            fatal("invalid secret name")
         try:
-            if '=' in s:
-                k, v = s.split('=', 1)
-                
-                # Handle different value sources
-                if v == '-':
-                    # Read from stdin
-                    echo(f"Reading secret '{k}' from stdin (end with EOF / Ctrl-D):", fg='yellow')
-                    content = stdin.read()
-                elif v.startswith('@'):
-                    # Read from file
-                    filename = v[1:]  # Remove the @ prefix
-                    if not exists(filename):
-                        echo(f"Error: File '{filename}' not found", fg='red')
-                        continue
-                    try:
-                        # Try to read as text first, fall back to binary if needed
-                        try:
-                            with open(filename, 'r', encoding='utf-8') as f:
-                                content = f.read()
-                        except UnicodeDecodeError:
-                            # File contains binary data, read as bytes and decode
-                            with open(filename, 'rb') as f:
-                                content = f.read().decode('utf-8', errors='replace')
-                        echo(f"Reading secret '{k}' from file '{filename}'", fg='green')
-                    except Exception as e:
-                        echo(f"Error reading file '{filename}': {str(e)}", fg='red')
-                        continue
-                elif exists(v):
-                    # If value looks like a file path and the file exists, read from it
-                    try:
-                        # Try to read as text first, fall back to binary if needed
-                        try:
-                            with open(v, 'r', encoding='utf-8') as f:
-                                content = f.read()
-                        except UnicodeDecodeError:
-                            # File contains binary data, read as bytes and decode
-                            with open(v, 'rb') as f:
-                                content = f.read().decode('utf-8', errors='replace')
-                        echo(f"Reading secret '{k}' from file '{v}'", fg='green')
-                    except Exception as e:
-                        echo(f"Error reading file '{v}': {str(e)}", fg='red')
-                        continue
-                else:
-                    # Treat as literal value
-                    content = v
+            if not separator or value == '-':
+                if not separator:
+                    echo(f"Enter value for secret '{name}' (end with EOF / Ctrl-D):")
+                source = getattr(stdin, 'buffer', stdin)
+                content = source.read()
+                if isinstance(content, str):
+                    content = content.encode('utf-8')
+            elif value.startswith('@') or exists(value):
+                # Keep the legacy bare-file-path form, but never decode bytes.
+                with open(value[1:] if value.startswith('@') else value, 'rb') as f:
+                    content = f.read()
             else:
-                # No = sign, prompt for value
-                k = s
-                echo(f"Enter value for secret '{k}' (end with EOF / Ctrl-D):", fg='yellow')
-                content = stdin.read()
-            
-            if not is_valid_docker_name(k):
-                echo(f"Error: invalid secret name '{k}'. Use letters, digits, '.', '_' or '-', starting with a letter or digit.", fg='red')
-                continue
-
-            echo(f"Setting secret '{k}'", fg='white')
-            run(['docker', 'secret', 'create', k, '-'], input=content,
-                 stdout=stdout, stderr=stderr, universal_newlines=True, text=True, check=True)
-                 
-        except ValueError:
-            echo(f"Error: Invalid format '{s}'. Use 'name=value', 'name=@filename', 'name=-', or just 'name'", fg='red')
-            continue
-        except Exception as e:
-            echo(f"Error setting secret '{k}': {str(e)}", fg='red')
-            continue
+                content = value.encode('utf-8')
+            run(['docker', 'secret', 'create', name, '-'], input=content,
+                stdout=stdout, stderr=stderr, check=True)
+        except Exception:
+            # Do not expose values or filenames from exception messages.
+            fatal(f"could not create secret '{name}'")
 
 
 @command('secrets:rm')
@@ -1737,10 +1692,15 @@ def cmd_mode(app, mode=None):
     if mode == current:
         echo(f"Mode unchanged ({current})", fg='yellow')
         return
+    # Tear down using the OLD mode before persisting the NEW mode.
+    if not do_stop(app):
+        fatal("mode change aborted: could not stop old deployment")
+    if current == 'swarm' and not wait_stack_removed(app):
+        fatal("mode change aborted: old stack still draining")
     set_app_mode(app, mode)
     echo(f"Set mode for '{app}' -> {mode}", fg='green')
-    echo("Restarting to apply mode change...", fg='yellow')
-    do_restart(app)
+    if not do_start(app):
+        fatal("new deployment failed; selected mode retained for recovery")
 
 
 @command('stop')
@@ -1858,16 +1818,27 @@ def cmd_git_hook(app):
     app_path = join(APP_ROOT, app)
     data_path = join(DATA_ROOT, app)
 
-    for line in stdin:
-        oldrev, newrev, refname = line.strip().split(" ")
-        if not exists(app_path):
-            echo("-----> Creating app '{}'".format(app), fg='green')
-            makedirs(app_path)
-            if not exists(data_path):
-                makedirs(data_path)
-            call("git clone --quiet {} {}".format(repo_path, app), cwd=APP_ROOT, shell=True)
-        if not do_deploy(app, newrev=newrev):
-            fatal("deployment failed")
+    from fcntl import flock, LOCK_EX
+    # Lock outside the working tree so git reset cannot replace the lock inode.
+    # All post-receive deployments of this app share the bare repository lock.
+    with open(join(repo_path, 'kata-deploy.lock'), 'a') as lock:
+        flock(lock.fileno(), LOCK_EX)
+        for line in stdin:
+            fields = line.split()
+            if len(fields) != 3:
+                fatal("invalid Git ref update")
+            oldrev, newrev, refname = fields
+            if not fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', newrev):
+                fatal("invalid Git revision")
+            if not newrev.strip('0'):
+                continue  # Deleted refs do not have a checkout target.
+            if not exists(app_path):
+                makedirs(APP_ROOT, exist_ok=True)
+                makedirs(data_path, exist_ok=True)
+                if call(['git', 'clone', '--quiet', repo_path, app_path]) != 0:
+                    fatal("initial clone failed")
+            if not do_deploy(app, newrev=newrev):
+                fatal("deployment failed")
 
 
 @command("git-receive-pack", hidden=True)

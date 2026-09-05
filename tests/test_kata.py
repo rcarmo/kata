@@ -118,5 +118,52 @@ class AuditRegressionTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [script])
 
 
+class RemainingAuditTests(unittest.TestCase):
+    def test_binary_secret_is_not_decoded(self):
+        from tempfile import TemporaryDirectory
+        from click.testing import CliRunner
+        with TemporaryDirectory() as directory:
+            secret = Path(directory) / 'secret'
+            secret.write_bytes(b'\xff\x00\r\n')
+            with patch.object(kata, 'require_swarm_or_warn', return_value=True), \
+                 patch.object(kata, 'run') as execute:
+                result = CliRunner().invoke(kata.cli, ['secrets:set', f'key=@{secret}'])
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(execute.call_args.kwargs['input'], b'\xff\x00\r\n')
+
+    def test_mode_stops_old_mode_before_saving_new(self):
+        from click.testing import CliRunner
+        events = []
+        with patch.object(kata, 'exit_if_invalid', return_value='app'), \
+             patch.object(kata, 'get_app_mode', return_value='swarm'), \
+             patch.object(kata, 'do_stop', side_effect=lambda app: events.append('stop') or True), \
+             patch.object(kata, 'wait_stack_removed', side_effect=lambda app: events.append('drain') or True), \
+             patch.object(kata, 'set_app_mode', side_effect=lambda *args: events.append('save')), \
+             patch.object(kata, 'do_start', side_effect=lambda app: events.append('start') or True):
+            result = CliRunner().invoke(kata.cli, ['mode', 'app', 'compose'])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(events, ['stop', 'drain', 'save', 'start'])
+
+    def test_git_failure_prevents_deploy(self):
+        with patch.object(kata, 'exists', return_value=True), \
+             patch.object(kata, 'call', return_value=1), \
+             patch.object(kata, 'parse_compose') as parse:
+            self.assertFalse(kata.do_deploy('app'))
+            parse.assert_not_called()
+
+    def test_deleted_git_ref_does_not_deploy(self):
+        from tempfile import TemporaryDirectory
+        from click.testing import CliRunner
+        with TemporaryDirectory() as directory:
+            (Path(directory) / 'app').mkdir()
+            with patch.object(kata, 'GIT_ROOT', directory), \
+                 patch.object(kata, 'do_deploy') as deploy:
+                result = CliRunner().invoke(kata.cli, ['git-hook', 'app'],
+                    input='a' * 40 + ' ' + '0' * 40 + ' refs/heads/main\n')
+            self.assertEqual(result.exit_code, 0, result.output)
+            deploy.assert_not_called()
+            self.assertTrue((Path(directory) / 'app' / 'kata-deploy.lock').exists())
+
+
 if __name__ == "__main__":
     unittest.main()
