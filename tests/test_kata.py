@@ -233,5 +233,28 @@ class SSHCommandTests(unittest.TestCase):
         self.assertEqual(result.exception.code, 1)
 
 
+class RuntimeAuditTests(unittest.TestCase):
+    def test_image_removal_failure_is_false(self):
+        with patch.object(kata, 'call', return_value=1):
+            self.assertFalse(kata.docker_remove_image('kata/python'))
+
+    def test_tempfile_creation_failure_is_reported_without_unbound_variable(self):
+        with patch.object(kata, 'NamedTemporaryFile', side_effect=OSError('denied')):
+            self.assertFalse(kata.docker_create_runtime_image('kata/test', 'FROM scratch'))
+
+    def test_rebuild_cli_failure_exits_nonzero(self):
+        from click.testing import CliRunner
+        with patch.object(kata, 'docker_rebuild_runtime', return_value=False):
+            result = CliRunner().invoke(kata.cli, ['runtime:rebuild', 'python'])
+        self.assertEqual(result.exit_code, 1)
+
+    def test_runtime_clean_failure_does_not_claim_success(self):
+        from click.testing import CliRunner
+        with patch.object(kata, 'docker_remove_runtime_images', return_value=False):
+            result = CliRunner().invoke(kata.cli, ['runtime:clean'])
+        self.assertEqual(result.exit_code, 1)
+        self.assertNotIn('Runtime images removed', result.output)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -622,6 +622,7 @@ def docker_check_image_exists(image_name):
 
 def docker_create_runtime_image(image_name, dockerfile_content):
     """Create a Docker image from a Dockerfile content"""
+    dockerfile_path = None
     try:
         with NamedTemporaryFile(delete=False, mode='w', suffix='.Dockerfile') as dockerfile:
             dockerfile.write(dockerfile_content)
@@ -633,14 +634,14 @@ def docker_create_runtime_image(image_name, dockerfile_content):
         echo(f"Error creating image: {str(e)}", fg='red')
         return False
     finally:
-        remove(dockerfile_path)
+        if dockerfile_path and exists(dockerfile_path):
+            remove(dockerfile_path)
 
 
 def docker_remove_image(image_name: str, warn: bool = True) -> bool:
     """Remove a Docker image; return True on success, False on failure."""
     try:
-        call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True)
-        return True
+        return call(['docker', 'rmi', '-f', image_name], stdout=stdout, stderr=stderr, universal_newlines=True) == 0
     except Exception as exc:
         if warn:
             echo(f"Warning: could not remove {image_name}: {exc}", fg='yellow')
@@ -670,11 +671,14 @@ def docker_rebuild_runtime(runtime: str) -> bool:
     return docker_create_runtime_image(image_name, dockerfile_content)
 
 
-def docker_remove_runtime_images() -> None:
-    """Remove all built-in runtime images (kata/*)."""
+def docker_remove_runtime_images() -> bool:
+    """Remove all built-in runtime images (kata/*), reporting partial failure."""
+    all_ok = True
     for image_name in RUNTIME_IMAGES.keys():
         echo(f"-----> Removing {image_name}", fg='yellow')
-        docker_remove_image(image_name, warn=True)
+        if not docker_remove_image(image_name, warn=True):
+            all_ok = False
+    return all_ok
 
 
 def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None):
@@ -719,7 +723,7 @@ def docker_handle_runtime_environment(app_name, runtime, destroy=False, env=None
         }
     for cmd in cmds.get(runtime, []):
         echo(f"Running: {' '.join(cmd)}", fg='green')
-        call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
+        checked_call(['docker', 'run', '--rm'] + volumes + ['-i', f'kata/{runtime}'] + cmd,
              cwd=join(APP_ROOT, app_name), env=env, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 # === App Management ===
@@ -1242,7 +1246,7 @@ def cmd_secrets_rm(secret):
     if not is_valid_docker_name(secret):
         echo(f"Error: invalid secret name '{secret}'.", fg='red')
         return
-    call(['docker', 'secret', 'rm', secret], stdout=stdout, stderr=stderr, universal_newlines=True)
+    checked_call(['docker', 'secret', 'rm', secret], stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('secrets:ls')
@@ -1250,7 +1254,7 @@ def cmd_secrets_ls():
     """List docker secrets defined in host."""
     if not require_swarm_or_warn():
         return
-    call(['docker', 'secret', 'ls'], stdout=stdout, stderr=stderr, universal_newlines=True)
+    checked_call(['docker', 'secret', 'ls'], stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('config:docker')
@@ -1382,7 +1386,7 @@ def cmd_runtime_rebuild_all():
     if ok:
         echo("-----> Runtime images rebuilt successfully", fg='green')
     else:
-        echo("Warning: one or more runtime images failed to rebuild", fg='yellow')
+        fatal("one or more runtime images failed to rebuild")
 
 
 @command('runtime:rebuild')
@@ -1393,13 +1397,14 @@ def cmd_runtime_rebuild(runtime):
     if ok:
         echo(f"-----> Runtime '{runtime}' rebuilt successfully", fg='green')
     else:
-        echo(f"Error: failed to rebuild runtime '{runtime}'", fg='red')
+        fatal(f"failed to rebuild runtime '{runtime}'")
 
 
 @command('runtime:clean')
 def cmd_runtime_clean():
     """Remove all built-in runtime images (kata/*)."""
-    docker_remove_runtime_images()
+    if not docker_remove_runtime_images():
+        fatal("one or more runtime images could not be removed")
     echo("-----> Runtime images removed (kata/*)", fg='green')
 
 
@@ -1744,7 +1749,7 @@ def cmd_setup_ssh(public_key_file):
     def add_helper(key_file):
         if exists(key_file):
             try:
-                fingerprint = str(check_output('ssh-keygen -lf ' + key_file, shell=True)).split(' ', 4)[1]
+                fingerprint = check_output(['ssh-keygen', '-lf', key_file], universal_newlines=True).split()[1]
                 key = open(key_file, 'r').read().strip()
                 echo("Adding key '{}'.".format(fingerprint), fg='white')
                 setup_authorized_keys(fingerprint, KATA_SCRIPT, key)
@@ -1861,13 +1866,13 @@ def cmd_git_receive_pack(app):
     # INTERNAL: Handle git pushes for an app
     app = sanitize_app_name(app)
     hook_path = join(GIT_ROOT, app, 'hooks', 'post-receive')
-    env = globals()
+    env = dict(globals())
     env.update(locals())
 
     if not exists(hook_path):
         makedirs(dirname(hook_path))
         # Initialize the repository with a hook to this script
-        call("git init --quiet --bare " + app, cwd=GIT_ROOT, shell=True)
+        checked_call(['git', 'init', '--quiet', '--bare', app], cwd=GIT_ROOT)
         with open(hook_path, 'w', encoding='utf-8') as h:
             h.write("""#!/usr/bin/env bash
 set -e; set -o pipefail;
@@ -1875,7 +1880,7 @@ cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env
         # Make the hook executable by our user
         chmod(hook_path, stat(hook_path).st_mode | S_IXUSR)
     # Handle the actual receive. We'll be called with 'git-hook' after it happens
-    call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
+    checked_call(['git-shell', '-c', argv[1] + " '" + app + "'"], cwd=GIT_ROOT)
 
 
 @command("git-upload-pack", hidden=True)
@@ -1883,17 +1888,17 @@ cat | KATA_ROOT="{KATA_ROOT:s}" {KATA_SCRIPT:s} git-hook {app:s}""".format(**env
 def cmd_git_upload_pack(app):
     # INTERNAL: Handle git upload pack for an app
     app = sanitize_app_name(app)
-    env = globals()
+    env = dict(globals())
     env.update(locals())
     # Handle the actual receive. We'll be called with 'git-hook' after it happens
-    call('git-shell -c "{}" '.format(argv[1] + " '{}'".format(app)), cwd=GIT_ROOT, shell=True)
+    checked_call(['git-shell', '-c', argv[1] + " '" + app + "'"], cwd=GIT_ROOT)
 
 
 @command("scp", context_settings=dict(ignore_unknown_options=True))
 @argument('args', nargs=-1, required=True, type=UNPROCESSED)
 def cmd_scp(args):
     """Copy files to/from the server"""
-    call(["scp"] + list(args), cwd=abspath(environ['HOME']))
+    checked_call(["scp"] + list(args), cwd=abspath(environ['HOME']))
 
 
 # Helper to print CLI help

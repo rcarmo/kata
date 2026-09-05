@@ -293,3 +293,10 @@ Swarm lifecycle tests remain unverified; no host orchestration configuration was
 changed. Package pinning is not applied blindly: frozen apt versions can prevent
 security updates and require a maintained snapshot/refresh policy. Runtime image
 reproducibility remains a documented operational follow-up, not a claim of this audit.
+
+Additional runtime/SSH checks: image removal returns Docker failure status;
+rebuild/clean commands fail non-zero rather than claiming success. Runtime setup
+commands are checked. Temporary Dockerfile creation failures do not mask the
+original error with an uninitialized cleanup path. Git-shell and SCP passthrough
+use checked argv calls; SSH fingerprint lookup no longer interpolates a filename
+into a shell command. Regression suite: 27 tests passing.
