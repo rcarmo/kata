@@ -83,7 +83,7 @@ A top-level `caddy:` key is rejected with an error.
 - `static: true` (shorthand) — sets `image: kata/static`, defaults `PORT=8000`, `DOCROOT=/app`.
 - If you supply `image:` yourself, **no** runtime automation runs.
 - On the no-`image` path, if a service omits `volumes:`, Kata injects `["app:/app", "config:/config", "data:/data", "venv:/venv"]`. Custom volumes are honored (with a warning).
-- A non-static service without `command` triggers a warning and skips environment normalisation.
+- Services may use their image default command; environment normalisation still runs.
 
 ### Environment forms
 
@@ -289,12 +289,11 @@ validation does not authenticate the downloaded script: upstream is trusted.
 
 ### Parser and routing limitations
 
-* Default service mounts are added only on the no-`image` path. Explicit images
-  need explicit mounts. `static: true` sets an image early and does not take the
-  runtime build/mount path; prefer `runtime: static`.
-* A non-static service without `command` skips environment normalisation, even
-  when its image has a valid default command. Supplying both `image` and `runtime`
-  skips runtime preparation but currently leaves the `runtime` key in output.
+* Runtime services without an explicit image receive default mounts if none are
+  supplied. Explicit images need explicit mounts. `static: true` selects the
+  static runtime; an explicit image still takes precedence.
+* Image default commands are supported and do not skip environment normalisation.
+  The Kata-only `runtime` and `static` keys are consumed before writing output.
 * `apply_traefik` defaults its port directly to 8000, not to a declared exposed
   port. Rendering config can run parsing/runtime preparation and create folders.
 * Label generation is opt-in, but `do_deploy` calls shared Traefik bootstrap
@@ -307,7 +306,7 @@ validation does not authenticate the downloaded script: upstream is trusted.
 
 ### Verification and remaining limits
 
-On 2026-09-05, 27 mocked regression tests passed. An isolated Alpine container with
+On 2026-09-05, 30 mocked regression tests passed. An isolated Alpine container with
 Compose-compatible labels verified local discovery, non-interactive exec and
 failure exit status against Docker 29.1.3, and was removed afterward. The test host
 has no Compose plugin and Swarm is inactive; live Compose/Swarm lifecycle tests and

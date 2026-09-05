@@ -256,5 +256,32 @@ class RuntimeAuditTests(unittest.TestCase):
         self.assertNotIn('Runtime images removed', result.output)
 
 
+class ParserAuditTests(unittest.TestCase):
+    def parse(self, service):
+        data = {'services': {'web': service}, 'volumes': {}}
+        with patch.object(kata, 'load_yaml', return_value=data), \
+             patch.object(kata, 'base_env', return_value={'TEST': 'value'}), \
+             patch.object(kata, 'docker_handle_runtime_environment') as prepare:
+            result, _ = kata.parse_compose('app', 'unused')
+        return result['services']['web'], prepare
+
+    def test_image_default_command_still_merges_environment(self):
+        service, _ = self.parse({'image': 'alpine', 'environment': ['OWN=yes']})
+        self.assertEqual(service['environment'], {'OWN': 'yes', 'TEST': 'value'})
+
+    def test_explicit_image_consumes_runtime_without_preparing(self):
+        service, prepare = self.parse({'image': 'alpine', 'runtime': 'python'})
+        self.assertNotIn('runtime', service)
+        prepare.assert_not_called()
+        self.assertNotIn('volumes', service)
+
+    def test_static_shorthand_prepares_image_and_mounts(self):
+        service, prepare = self.parse({'static': True})
+        self.assertEqual(service['image'], 'kata/static')
+        self.assertIn('app:/app', service['volumes'])
+        prepare.assert_called_once_with('app', 'static', env={'TEST': 'value'})
+        self.assertNotIn('static', service)
+
+
 if __name__ == "__main__":
     unittest.main()

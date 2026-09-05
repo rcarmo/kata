@@ -131,7 +131,7 @@ Recommended to set:
 
 Declare `ports` or `expose` on the service you want Traefik to reach; Kata no longer adds these automatically. If you prefer a different target, set `traefik.service` (and `traefik.port` if it differs from the declared port).
 
-Base variables are merged during service normalisation. Current limitation: non-static services without an explicit `command` skip that normalisation; see the spec.
+Base variables are merged during service normalisation, including services using an image default command.
 
 For more details on Traefik labels, see the [Traefik reference](https://doc.traefik.io/traefik/routing/routers/).
 
@@ -269,7 +269,7 @@ supports non-interactive SSH without forcing a TTY.
 make test
 ```
 
-Use an environment with `click` and `pyyaml` installed. The 27 regression tests cover lifecycle failures, cleanup guards, binary secrets, mode ordering, updater replacement and SSH exit status. Live Compose/Swarm lifecycle verification remains outstanding; see the spec.
+Use an environment with `click` and `pyyaml` installed. The 30 regression tests cover lifecycle failures, cleanup guards, binary secrets, mode ordering, updater replacement and SSH exit status. Live Compose/Swarm lifecycle verification remains outstanding; see the spec.
 
 ---
 

@@ -772,33 +772,21 @@ def parse_compose(app_name, filename) -> tuple:
     services = data.get("services", {})
 
     for service_name, service in services.items():
-        is_static = bool(service.pop('static', False)) if isinstance(service, dict) else False
-        echo(f"-----> Preparing service '{service_name}'", fg='green')
+        if not isinstance(service, dict):
+            fatal(f"service '{service_name}' must be a mapping")
+        is_static = bool(service.pop('static', False))
         if is_static:
-            service["image"] = "kata/static"
-            service.setdefault("environment", {})
-            # Let env normalization handle list/dict forms; defaults preserve existing
-            if isinstance(service["environment"], dict):
-                service["environment"].setdefault("PORT", "8000")
-                service["environment"].setdefault("DOCROOT", "/app")
-
-        if not "image" in service:
-            if "runtime" in service:
-                service["image"] = f"kata/{service['runtime']}"
-                echo(f"=====> '{service_name}' will use runtime '{service['runtime']}'", fg='green')
-                if service["image"] in RUNTIME_IMAGES:
-                    docker_handle_runtime_environment(app_name, service["runtime"], env=env)
-                else:
-                    fatal(f"runtime '{service['runtime']}' not supported")
-                del service["runtime"]
-            if not "volumes" in service:
-                service["volumes"] = ["app:/app", "config:/config", "data:/data", "venv:/venv"]
-            else:
-                echo(f"Warning: service '{service_name}' has custom volumes, ensure they are correct", fg='yellow')
-        if not "command" in service:
-            if not is_static:
-                echo(f"Warning: service '{service_name}' has no 'command' specified", fg='yellow')
-                continue
+            service.setdefault('runtime', 'static')
+        runtime = service.pop('runtime', None)
+        echo(f"-----> Preparing service '{service_name}'", fg='green')
+        if 'image' not in service and runtime:
+            image = f"kata/{runtime}"
+            if image not in RUNTIME_IMAGES:
+                fatal(f"runtime '{runtime}' not supported")
+            service['image'] = image
+            docker_handle_runtime_environment(app_name, runtime, env=env)
+            service.setdefault('volumes', ['app:/app', 'config:/config', 'data:/data', 'venv:/venv'])
+        # An image's default command is valid; environment merging must still run.
         # No auto-expose: users must set ports/expose explicitly for reachable services.
         # Normalize and merge environment
         if "environment" not in service:
