@@ -529,6 +529,17 @@ def fatal(message, code: int = 1):
     raise SystemExit(code)
 
 
+def checked_call(args, **kwargs):
+    """Run a CLI operation and preserve failures for SSH/Make callers."""
+    try:
+        code = call(args, **kwargs)
+    except OSError as exc:
+        fatal(f"could not execute {args[0]}: {exc}")
+    if code:
+        raise SystemExit(code if code > 0 else 128 - code)
+    return code
+
+
 def base_env(app, env=None) -> dict:
     """Get the environment variables for an app"""
     base = {'PGID': str(PGID), 'PUID': str(PUID)}
@@ -1542,7 +1553,7 @@ def cmd_docker(args):
 @argument('stack', required=True)
 def cmd_services(stack):
     """List services for a stack"""
-    call(['docker', 'stack', 'services', stack],
+    checked_call(['docker', 'stack', 'services', stack],
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -1556,16 +1567,15 @@ def cmd_service_ps(service):
     mode = get_app_mode(app)
 
     if mode == 'swarm':
-        call(['docker', 'service', 'ps'] + ([f"{app}_{s}" for s in extras] if extras else [app]),
+        checked_call((['docker', 'service', 'ps'] + [f"{app}_{s}" for s in extras] if extras else ['docker', 'stack', 'ps', app]),
              stdout=stdout, stderr=stderr, universal_newlines=True)
         return
 
     # Compose mode
     compose_path = join(APP_ROOT, app, DOCKER_COMPOSE)
     if not exists(compose_path):
-        echo(f"Error: compose file not found for app '{app}' at {compose_path}", fg='red')
-        return
-    call(get_compose_cmd() + ['-f', compose_path, 'ps'] + extras,
+        fatal(f"Error: compose file not found for app '{app}' at {compose_path}")
+    checked_call(get_compose_cmd() + ['-f', compose_path, 'ps'] + extras,
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -1583,11 +1593,10 @@ def cmd_run(index, app, service, command):
         fatal(f"no local running container for '{app}/{service}'; check task placement with ps. Use 'docker exec' explicitly for raw container names.")
     else:
         if index < 0 or index >= len(refs):
-            echo(f"Error: index {index} out of range (found {len(refs)} container(s))", fg='red')
-            return
+            fatal(f"Error: index {index} out of range (found {len(refs)} container(s))")
         target = refs[index]['id']
         echo(f"-----> exec into {refs[index]['name']} ({target[:12]})", fg='green')
-    call(['docker', 'exec', '-ti', target] + list(command),
+    checked_call(['docker', 'exec', '-i'] + (['-t'] if stdin.isatty() and stdout.isatty() else []) + [target] + list(command),
          stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -1598,14 +1607,13 @@ def cmd_app_services(app):
     app = exit_if_invalid(app)
     mode = get_app_mode(app)
     if mode == 'swarm':
-        call(['docker', 'stack', 'services', app],
+        checked_call(['docker', 'stack', 'services', app],
              stdout=stdout, stderr=stderr, universal_newlines=True)
     else:
         compose_path = join(APP_ROOT, app, DOCKER_COMPOSE)
         if not exists(compose_path):
-            echo(f"Error: compose file not found for app '{app}' at {compose_path}", fg='red')
-            return
-        call(get_compose_cmd() + ['-f', compose_path, 'ps'],
+            fatal(f"Error: compose file not found for app '{app}' at {compose_path}")
+        checked_call(get_compose_cmd() + ['-f', compose_path, 'ps'],
              stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
@@ -1635,8 +1643,7 @@ def cmd_logs(follow, tail, app, service=None):
     mode = get_app_mode(app)
     if mode == 'swarm':
         if not service:
-            echo("Error: in swarm mode a service name is required: kata logs <app> <service>", fg='red')
-            return
+            fatal("Error: in swarm mode a service name is required: kata logs <app> <service>")
         cmd = ['docker', 'service', 'logs', '--tail', str(tail)]
         if follow:
             cmd.append('-f')
@@ -1644,14 +1651,13 @@ def cmd_logs(follow, tail, app, service=None):
     else:
         compose_path = join(APP_ROOT, app, DOCKER_COMPOSE)
         if not exists(compose_path):
-            echo(f"Error: compose file not found for app '{app}' at {compose_path}", fg='red')
-            return
+            fatal(f"Error: compose file not found for app '{app}' at {compose_path}")
         cmd = get_compose_cmd() + ['-f', compose_path, 'logs', '--tail', str(tail)]
         if follow:
             cmd.append('-f')
         if service:
             cmd.append(service)
-    call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
+    checked_call(cmd, stdout=stdout, stderr=stderr, universal_newlines=True)
 
 
 @command('restart')
@@ -1670,11 +1676,11 @@ def cmd_restart(show_logs, app, service):
             last = service[-1]
             echo(f"-----> Following logs for '{last}' (Ctrl-C to stop)", fg='green')
             if mode == 'swarm':
-                call(['docker', 'service', 'logs', '--tail', '0', '-f', f"{app}_{last}"],
+                checked_call(['docker', 'service', 'logs', '--tail', '0', '-f', f"{app}_{last}"],
                      stdout=stdout, stderr=stderr, universal_newlines=True)
             else:
                 compose_path = join(APP_ROOT, app, DOCKER_COMPOSE)
-                call(get_compose_cmd() + ['-f', compose_path, 'logs', '--tail', '0', '-f', last],
+                checked_call(get_compose_cmd() + ['-f', compose_path, 'logs', '--tail', '0', '-f', last],
                      stdout=stdout, stderr=stderr, universal_newlines=True)
     else:
         if not do_restart(app):

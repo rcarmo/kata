@@ -279,3 +279,17 @@ mount roots. Failed container or host deletion exits non-zero and does not repor
 success. This path validation is defense in depth, not protection against a
 concurrent hostile administrator changing paths after validation; Kata assumes a
 trusted deployment account with Docker access.
+
+SSH command hardening: `run`, `logs`, `services`, `docker:services`, and `ps`
+propagate subprocess failures through a shared checked-call helper. `run` only
+requests a TTY when stdin and stdout are terminals. App-wide Swarm `ps` uses
+`docker stack ps`, not a nonexistent service named after the stack.
+
+Verification on 2026-09-05: 23 mocked regression tests passed. An isolated Alpine
+container with Compose-compatible labels verified discovery, non-interactive exec,
+and exit-status propagation against Docker 29.1.3; it was removed afterward.
+The test host has no Compose plugin and Swarm is inactive, so live Compose and
+Swarm lifecycle tests remain unverified; no host orchestration configuration was
+changed. Package pinning is not applied blindly: frozen apt versions can prevent
+security updates and require a maintained snapshot/refresh policy. Runtime image
+reproducibility remains a documented operational follow-up, not a claim of this audit.

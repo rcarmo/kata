@@ -209,5 +209,29 @@ class CleanupAuditTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 7)
 
 
+class SSHCommandTests(unittest.TestCase):
+    def test_logs_propagates_failure(self):
+        from click.testing import CliRunner
+        with patch.object(kata, 'exit_if_invalid', return_value='app'), \
+             patch.object(kata, 'get_app_mode', return_value='swarm'), \
+             patch.object(kata, 'call', return_value=5):
+            result = CliRunner().invoke(kata.cli, ['logs', 'app', 'web'])
+        self.assertEqual(result.exit_code, 5)
+
+    def test_swarm_ps_without_service_uses_stack(self):
+        from click.testing import CliRunner
+        with patch.object(kata, 'get_app_mode', return_value='swarm'), \
+             patch.object(kata, 'call', return_value=0) as execute:
+            result = CliRunner().invoke(kata.cli, ['ps', 'app'])
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(execute.call_args.args[0], ['docker', 'stack', 'ps', 'app'])
+
+    def test_checked_call_reports_missing_executable(self):
+        with patch.object(kata, 'call', side_effect=FileNotFoundError('missing')):
+            with self.assertRaises(SystemExit) as result:
+                kata.checked_call(['docker', 'info'])
+        self.assertEqual(result.exception.code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
