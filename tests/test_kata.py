@@ -60,5 +60,63 @@ class LifecycleErrorHandlingTests(unittest.TestCase):
             do_start.assert_not_called()
 
 
+class AuditRegressionTests(unittest.TestCase):
+    def test_drain_query_error_fails_closed(self):
+        with patch.object(kata, 'check_output', side_effect=OSError('offline')):
+            self.assertFalse(kata.wait_stack_removed('app'))
+
+    def test_drain_uses_namespace_for_networks(self):
+        with patch.object(kata, 'check_output', return_value='') as query:
+            self.assertTrue(kata.wait_stack_removed('app'))
+            self.assertIn('label=com.docker.stack.namespace=app', query.call_args.args[0])
+
+    def test_restart_cli_failure_is_nonzero(self):
+        from click.testing import CliRunner
+        with patch.object(kata, 'exit_if_invalid', return_value='app'), \
+             patch.object(kata, 'do_restart', return_value=False):
+            result = CliRunner().invoke(kata.cli, ['restart', 'app'])
+            self.assertEqual(result.exit_code, 1)
+
+    def test_no_implicit_raw_container_fallback(self):
+        from click.testing import CliRunner
+        with patch.object(kata, 'exit_if_invalid', return_value='app'), \
+             patch.object(kata, 'resolve_containers', return_value=[]), \
+             patch.object(kata, 'call') as execute:
+            result = CliRunner().invoke(kata.cli, ['run', 'app', 'db', 'sh'])
+            self.assertEqual(result.exit_code, 1)
+            execute.assert_not_called()
+
+    def test_update_preserves_mode_and_backup(self):
+        from click.testing import CliRunner
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            script = Path(directory) / 'kata.py'
+            old = '#!/usr/bin/env python3\nprint("old")\n'
+            new = '#!/usr/bin/env python3\nprint("new")\n'
+            script.write_text(old)
+            script.chmod(0o755)
+            with patch.object(kata, 'KATA_SCRIPT', str(script)), \
+                 patch.object(kata, '_http_get', return_value=new):
+                result = CliRunner().invoke(kata.cli, ['update', '--no-restart'])
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(script.read_text(), new)
+            self.assertEqual(Path(str(script) + '.backup').read_text(), old)
+            self.assertEqual(script.stat().st_mode & 0o777, 0o755)
+
+    def test_update_backup_failure_preserves_original(self):
+        from click.testing import CliRunner
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            script = Path(directory) / 'kata.py'
+            script.write_text('#!/usr/bin/env python3\n')
+            with patch.object(kata, 'KATA_SCRIPT', str(script)), \
+                 patch.object(kata, '_http_get', return_value='#!/usr/bin/env python3\npass\n'), \
+                 patch.object(kata, 'copyfile', side_effect=OSError('denied')):
+                result = CliRunner().invoke(kata.cli, ['update', '--no-restart'])
+            self.assertEqual(result.exit_code, 1)
+            self.assertEqual(script.read_text(), '#!/usr/bin/env python3\n')
+            self.assertEqual(list(Path(directory).iterdir()), [script])
+
+
 if __name__ == "__main__":
     unittest.main()

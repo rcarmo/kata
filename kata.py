@@ -521,12 +521,12 @@ def warn(message) -> None:
 
 
 def error(message) -> None:
-    echo(f"Error: {message}", fg='red')
+    echo(f"Error: {message}", fg='red', err=True)
 
 
 def fatal(message, code: int = 1):
     error(message)
-    exit(code)
+    raise SystemExit(code)
 
 
 def base_env(app, env=None) -> dict:
@@ -1119,11 +1119,13 @@ def wait_stack_removed(app, timeout: int = 60) -> bool:
         try:
             services = check_output(['docker', 'service', 'ls', '--quiet', '--filter', ns_filter],
                                     universal_newlines=True).strip()
-            # Networks don't reliably carry the stack label; match by name.
-            networks = check_output(['docker', 'network', 'ls', '--quiet', '--filter', f"name={app}_"],
+            # Stack-owned networks carry the same namespace label. External
+            # networks must not block teardown, nor should similarly named apps.
+            networks = check_output(['docker', 'network', 'ls', '--quiet', '--filter', ns_filter],
                                     universal_newlines=True).strip()
-        except Exception:
-            return True
+        except Exception as exc:
+            error(f"cannot verify stack teardown: {exc}")
+            return False
         if not services and not networks:
             return True
         sleep(1)
@@ -1491,7 +1493,9 @@ def cmd_destroy(app, force, wipe):
             return
 
     if not do_remove(app, wipe=wipe):
-        return
+        fatal("removal failed; directories preserved")
+    if get_app_mode(app) == 'swarm' and not wait_stack_removed(app):
+        fatal("teardown incomplete; directories preserved")
 
     paths = [join(APP_ROOT, app), join(ENV_ROOT, app), join(LOG_ROOT, app), join(GIT_ROOT, app)]
     data_path = join(DATA_ROOT, app)
@@ -1613,9 +1617,7 @@ def cmd_run(index, app, service, command):
     app = exit_if_invalid(app)
     refs = resolve_containers(app, service)
     if not refs:
-        # Fallback: treat 'service' as a literal container/service name
-        echo(f"No resolved container for '{app}/{service}', trying literal name '{service}'...", fg='yellow')
-        target = service
+        fatal(f"no local running container for '{app}/{service}'; check task placement with ps. Use 'docker exec' explicitly for raw container names.")
     else:
         if index < 0 or index >= len(refs):
             echo(f"Error: index {index} out of range (found {len(refs)} container(s))", fg='red')
@@ -1699,7 +1701,7 @@ def cmd_restart(show_logs, app, service):
     app = exit_if_invalid(app)
     if service:
         if not do_restart_services(app, list(service)):
-            return
+            fatal("service restart failed")
         if show_logs:
             mode = get_app_mode(app)
             last = service[-1]
@@ -1712,7 +1714,8 @@ def cmd_restart(show_logs, app, service):
                 call(get_compose_cmd() + ['-f', compose_path, 'logs', '--tail', '0', '-f', last],
                      stdout=stdout, stderr=stderr, universal_newlines=True)
     else:
-        do_restart(app)
+        if not do_restart(app):
+            fatal("restart failed")
 
 
 @command('mode')
@@ -1745,7 +1748,8 @@ def cmd_mode(app, mode=None):
 def cmd_stop(app):
     """Stop an app"""
     app = exit_if_invalid(app)
-    do_stop(app)
+    if not do_stop(app):
+        fatal("stop failed")
 
 
 @command('setup')
@@ -1795,19 +1799,16 @@ def cmd_update(force, no_restart):
     try:
         body = _http_get(KATA_RAW_SOURCE_URL)
     except Exception as e:
-        echo(f"Error: download failed: {e}", fg='red')
-        return
+        fatal(f"Error: download failed: {e}")
 
     if not body or not body.lstrip().startswith('#!'):
-        echo("Error: downloaded content does not look like a kata.py script; aborting.", fg='red')
-        return
+        fatal("Error: downloaded content does not look like a kata.py script; aborting.")
 
     # Validate it actually compiles before we overwrite anything.
     try:
         compile(body, '<kata-update>', 'exec')
     except SyntaxError as e:
-        echo(f"Error: downloaded kata.py failed to compile ({e}); aborting.", fg='red')
-        return
+        fatal(f"Error: downloaded kata.py failed to compile ({e}); aborting.")
 
     try:
         current = open(KATA_SCRIPT, 'r', encoding='utf-8').read()
@@ -1818,23 +1819,21 @@ def cmd_update(force, no_restart):
         return
 
     backup_file = f"{KATA_SCRIPT}.backup"
+    tmp = None
     try:
-        copyfile(KATA_SCRIPT, backup_file)
-        echo(f"-----> Backed up current version to {backup_file}", fg='yellow')
-    except Exception as e:
-        echo(f"Warning: could not create backup: {e}", fg='yellow')
-
-    # Write atomically: temp file in the same dir, then replace().
-    try:
-        tmp = f"{KATA_SCRIPT}.new"
-        with open(tmp, 'w', encoding='utf-8') as f:
+        # A unique same-directory temporary file avoids collisions and symlinks.
+        with NamedTemporaryFile(mode='w', encoding='utf-8',
+                                dir=dirname(KATA_SCRIPT), delete=False) as f:
+            tmp = f.name
             f.write(body)
-        chmod(tmp, S_IRUSR | S_IWUSR | S_IXUSR)
+        chmod(tmp, stat(KATA_SCRIPT).st_mode & 0o777)
+        copyfile(KATA_SCRIPT, backup_file)
         replace(tmp, KATA_SCRIPT)
-    except Exception as e:
-        echo(f"Error: failed to write update: {e}", fg='red')
-        echo(f"Your previous version is preserved at {backup_file}", fg='yellow')
-        return
+    except Exception as exc:
+        fatal(f"update failed; original script retained: {exc}")
+    finally:
+        if tmp and exists(tmp):
+            remove(tmp)
 
     echo("Update complete.", fg='green')
     if no_restart:
@@ -1867,7 +1866,8 @@ def cmd_git_hook(app):
             if not exists(data_path):
                 makedirs(data_path)
             call("git clone --quiet {} {}".format(repo_path, app), cwd=APP_ROOT, shell=True)
-        do_deploy(app, newrev=newrev)
+        if not do_deploy(app, newrev=newrev):
+            fatal("deployment failed")
 
 
 @command("git-receive-pack", hidden=True)

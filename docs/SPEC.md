@@ -244,7 +244,7 @@ This primitive backs `run` and `containers`.
 | `services <app>` | List logical services for an app (Swarm `stack services`, else `compose ps`). |
 | `containers <app> [service]` | Resolve and print concrete container IDs/names/status (the autodetect primitive). |
 | `logs <app> [service]` | Tail logs, mode-aware (`-f/--follow`, `--tail`). Swarm requires a service; Compose accepts app-wide or per-service. |
-| `run <app> <service> [--index N] <cmd...>` | Resolve the container for `(app, service)` (replica `N`) and `docker exec -ti` into it. Falls back to treating `service` as a literal container name when nothing resolves. |
+| `run <app> <service> [--index N] <cmd...>` | Resolve the container for `(app, service)` (replica `N`) and `docker exec -ti` into it. Fails when no local container resolves; use explicit `docker exec` passthrough for raw names. This avoids accidentally executing in an unrelated container. |
 
 Under Swarm, restarts use `docker service update --force` (cluster-aware, rolling) rather than killing individual task containers; container-level `exec` is reserved for `run`/debugging.
 
