@@ -723,9 +723,9 @@ def exit_if_invalid(app, deployed=False):
 
 
 def sanitize_app_name(app) -> str:
-    """Sanitize the app name"""
-    if app:
-        return sub(r'[^a-zA-Z0-9_-]', '', app)
+    """Reject unsafe names rather than silently targeting a different app."""
+    if not app or not fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', app):
+        fatal("invalid app name: use letters, digits, '_' or '-', starting with a letter or digit")
     return app
 
 
@@ -1438,8 +1438,13 @@ def cmd_destroy(app, force, wipe):
     app = sanitize_app_name(app)
     app_path = join(APP_ROOT, app)
     if not exists(app_path):
-        error(f"stack '{app}' not deployed!")
-        return
+        fatal(f"stack '{app}' not deployed!")
+    # Validate all deletion targets before stopping anything. A symlink under
+    # an app root must never turn a container bind mount into an arbitrary wipe.
+    for root in (APP_ROOT, ENV_ROOT, LOG_ROOT, GIT_ROOT, DATA_ROOT, CONFIG_ROOT):
+        path = join(root, app)
+        if realpath(path) != join(realpath(root), app):
+            fatal(f"refusing removal through redirected app path: {path}")
 
     if not force:
         response = input(f"Are you sure you want to destroy '{app}'? [y/N] ")
@@ -1484,16 +1489,13 @@ def cmd_destroy(app, force, wipe):
             echo(f"-----> {'Wiping all' if wipe else 'Removing code'} app directories", fg='yellow')
             # Run BusyBox as root (explicitly). On bind mounts this can delete root-owned files.
             # Note: on rootless Docker / userns remap, ownership semantics may differ.
-            # It cannot remove the mountpoint itself, so we also fix perms/ownership
-            # on the directory to let host-side rmtree() remove it.
+            # Delete contents, not mounted directory roots; include dotfiles.
             wipe_script = (
-                "for d; do "
-                "rm -rf \"$d\" 2>/dev/null || true; "
-                #f"chown {PUID}:{PGID} \"$d\" 2>/dev/null || true; "
-                #"chmod u+rwx \"$d\" 2>/dev/null || true; "
+                "set -e; for d; do "
+                "rm -rf -- \"$d\"/* \"$d\"/.[!.]* \"$d\"/..?*; "
                 "done"
             )
-            call(
+            rc = call(
                 ['docker', 'run', '--rm', '--user', '0:0']
                 + mounts
                 + [
@@ -1508,16 +1510,22 @@ def cmd_destroy(app, force, wipe):
                 stderr=stderr,
                 universal_newlines=True,
             )
-        except Exception as exc:
-            echo(f"Warning: {'Wipe' if wipe else 'Remove'} failed: {exc}", fg='yellow')
+            if rc != 0:
+                fatal("container cleanup failed; removal incomplete")
+        except OSError as exc:
+            fatal(f"could not run cleanup: {exc}")
 
+    failed = False
     for path in paths:
         if not exists(path):
             continue
         try:
             rmtree(path)
-        except Exception as e:
-            echo(f"Error removing {path}: {str(e)}", fg='red')
+        except OSError as e:
+            error(f"removing {path}: {e}")
+            failed = True
+    if failed:
+        fatal("removal incomplete")
     echo(f"-----> '{app}' destroyed", fg='green')
     if not wipe:
         echo("Data and config directories were not deleted. Use --wipe to remove them.", fg='yellow')
@@ -1526,8 +1534,8 @@ def cmd_destroy(app, force, wipe):
 @argument('args', nargs=-1, required=True, type=UNPROCESSED)
 def cmd_docker(args):
     """Pass-through Docker commands (logs, etc.)"""
-    call(['docker'] + list(args),
-         stdout=stdout, stderr=stderr, universal_newlines=True)
+    raise SystemExit(call(['docker'] + list(args),
+         stdout=stdout, stderr=stderr, universal_newlines=True))
 
 
 @command('docker:services')

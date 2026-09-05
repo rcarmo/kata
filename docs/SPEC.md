@@ -271,3 +271,11 @@ This document should be updated alongside code changes; discrepancies mean the c
 - Self-update uses a unique same-directory temporary file, preserves file permissions,
   and requires a successful backup before replacement. Syntax validation is not
   signature verification: the upstream repository remains a trusted code source.
+
+Cleanup rejects invalid app names rather than rewriting them. Before stopping an
+app, it rejects redirected (symlinked) per-app paths. The root cleanup container
+removes directory contents, including dotfiles, without attempting to unlink bind
+mount roots. Failed container or host deletion exits non-zero and does not report
+success. This path validation is defense in depth, not protection against a
+concurrent hostile administrator changing paths after validation; Kata assumes a
+trusted deployment account with Docker access.

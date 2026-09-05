@@ -165,5 +165,49 @@ class RemainingAuditTests(unittest.TestCase):
             self.assertTrue((Path(directory) / 'app' / 'kata-deploy.lock').exists())
 
 
+class CleanupAuditTests(unittest.TestCase):
+    def test_invalid_app_names_are_not_silently_rewritten(self):
+        for name in ['', '../', 'app/name', '-option', 'app.name']:
+            with self.subTest(name=name), self.assertRaises(SystemExit):
+                kata.sanitize_app_name(name)
+
+    def test_symlinked_app_is_rejected_before_stop(self):
+        from tempfile import TemporaryDirectory
+        from click.testing import CliRunner
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'apps').mkdir()
+            (root / 'outside').mkdir()
+            (root / 'apps' / 'app').symlink_to(root / 'outside')
+            with patch.object(kata, 'APP_ROOT', str(root / 'apps')), \
+                 patch.object(kata, 'do_remove') as remove:
+                result = CliRunner().invoke(kata.cli, ['rm', 'app', '--force'])
+            self.assertEqual(result.exit_code, 1, result.output)
+            remove.assert_not_called()
+            self.assertTrue((root / 'outside').exists())
+
+    def test_failed_cleanup_never_reports_destroyed(self):
+        from tempfile import TemporaryDirectory
+        from click.testing import CliRunner
+        from contextlib import ExitStack
+        with TemporaryDirectory() as directory, ExitStack() as patches:
+            for key in kata.ROOT_FOLDERS:
+                root = Path(directory) / key
+                (root / 'app').mkdir(parents=True)
+                patches.enter_context(patch.object(kata, key, str(root)))
+            patches.enter_context(patch.object(kata, 'do_remove', return_value=True))
+            patches.enter_context(patch.object(kata, 'get_app_mode', return_value='compose'))
+            patches.enter_context(patch.object(kata, 'call', return_value=1))
+            result = CliRunner().invoke(kata.cli, ['rm', 'app', '--force'])
+            self.assertEqual(result.exit_code, 1)
+            self.assertNotIn("'app' destroyed", result.output)
+
+    def test_docker_passthrough_preserves_failure(self):
+        from click.testing import CliRunner
+        with patch.object(kata, 'call', return_value=7):
+            result = CliRunner().invoke(kata.cli, ['docker', 'info'])
+        self.assertEqual(result.exit_code, 7)
+
+
 if __name__ == "__main__":
     unittest.main()
