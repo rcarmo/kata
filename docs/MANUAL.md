@@ -1,201 +1,116 @@
-# Kata Manual
+# Operating Kata
 
 ![Kata logo](kata-256.png)
 
-A practical guide to deploying and managing apps with Kata (micro-PaaS on Docker) and its implicit Traefik routing.
+Kata keeps its implementation in one Python file. Git pushes prepare runtime dependencies and generate `.docker-compose.yaml`; lifecycle commands operate on that generated deployment. Install it using the [installation guide](INSTALL.md), and use [SPEC.md](SPEC.md) for configuration details and known limitations.
 
-## What is Kata?
+## Deploying and restarting
 
-Kata is a single-file deployment tool that lets you:
+Push a repository containing `kata-compose.yaml` to `kata@host:APP`. App names start with a letter or digit and otherwise contain letters, digits, `_` or `-`. Invalid names are rejected, not rewritten.
 
-- Push an app via git (Piku/Heroku-style) or manage it locally
-- Start services with Docker Compose or Docker Swarm
-- Get HTTP/HTTPS routing automatically via Traefik labels (no router config needed)
+Post-receive hooks serialize deployments with `repos/APP/kata-deploy.lock`. Failed clone, fetch, reset or submodule commands stop deployment. Deleted refs are skipped. Other ref updates are deployed without a branch allowlist; push only the intended deployment branch. The lock does not cover concurrent manual lifecycle commands.
 
-It reads `kata-compose.yaml`, prepares a Docker Compose file, generates Traefik labels, and starts your stack.
-
-## Requirements
-
-- Python 3.12+
-- Docker (Compose V2 preferred; V1 `docker-compose` works)
-- Optional: Docker Swarm (for stacks and secrets)
-- Optional: Traefik v3 on the host (Kata will start or reuse a shared Traefik if none is running)
-
-Notes:
-
-- Kata auto-detects Swarm. Default mode is `swarm` when active, otherwise `compose`.
-- Services attach to external Docker network `traefik-proxy`; certificates live in volume `traefik-acme` (created if missing).
-- systemd lingering/user services are not required by the current code path.
-
-## Paths, volumes, and app layout
-
-Kata manages per-app folders under a configurable root (defaults shown):
-
-- APP_ROOT: `~/app/APP` — your checked-out code (mounted at `/app`)
-- DATA_ROOT: `~/data/APP` — persistent data (mounted at `/data`)
-- CONFIG_ROOT: `~/config/APP` — app config (.env, etc.) (mounted at `/config`)
-- ENV_ROOT: `~/envs/APP` — runtime environment (e.g., Python venv) (mounted at `/venv`)
-- GIT_ROOT: `~/repos/APP` — bare git repo for pushes
-- LOG_ROOT: `~/logs/APP` — reserved for logs
-
-Implicit Compose volumes per service
-
-- `app` → bind-mount to `/app` (APP_ROOT/<app>)
-- `data` → bind-mount to `/data` (DATA_ROOT/<app>) — use this for databases and persistent state
-- `config` → bind-mount to `/config` (CONFIG_ROOT/<app>)
-- `venv` → bind-mount to `/venv` (ENV_ROOT/<app>)
-
-Unless you specify your own `volumes`, Kata injects these for each service. If you override volumes, ensure you add back what you need (e.g., reuse `data:/var/lib/postgresql/data` for databases).
-
-## Install and initial setup
-
-1. Place `kata.py` on your host and make it executable.
-2. Run `kata setup` — creates the root folders above.
-3. (Optional) Enable git-push deploys: `kata setup:ssh ~/.ssh/id_rsa.pub` (adds a forced-command entry to `~/.ssh/authorized_keys`).
-
-## Your app repository
-
-Include at least:
-
-- `kata-compose.yaml` — deployment spec
-- Application code at repo root (mounted at `/app`)
-- Optional runtime inputs: `requirements.txt`, `package.json`, etc.
-
-Kata supports runtime shortcuts when `image:` is omitted: `runtime: python`, `runtime: nodejs`, `runtime: php`, `runtime: bun`, or `runtime: static` (BusyBox httpd; defaults `PORT=8000`, `DOCROOT=/app`). You can also set `static: true` on a service to auto-wire `kata/static` with sensible defaults.
-
-## Compose specification (kata-compose.yaml)
-
-Top-level keys:
-
-- `environment`: defaults applied to all services (merged; does not override service-specific keys)
-- `services`: standard Compose services
-- `x-kata-mode`: optional override of `compose` or `swarm`
-
-Notes:
-
-- Environment variables are expanded (e.g., `$APP_ROOT`, `$DATA_ROOT`, `$PORT`).
-- Volumes are auto-bound to `/app`, `/config`, `/data`, `/venv` unless you override.
-- Setting `static: true` on a service rewrites it to `image: kata/static` and defaults `PORT=8000`, `DOCROOT=/app` (runtime shorthand is also supported).
-- A top-level `caddy:` key now triggers a hard error. Remove it and rely on Traefik labels.
-
-Minimal example (Traefik defaults, no host port publishing):
-
-```yaml
-# kata-compose.yaml
-environment:
-  PORT: 8000
-
-services:
-  web:
-    runtime: python
-    command: uvicorn main:app --host 0.0.0.0 --port ${PORT}
-    expose:
-      - "${PORT}"
+```bash
+kata restart APP
+kata restart APP web
+kata restart APP builder --logs
+kata stop APP
 ```
 
-If you truly need loopback host bindings, force compose mode with `x-kata-mode: compose` and add `ports: ["127.0.0.1:${PORT}:${PORT}"]`.
+Whole-app restart stops then starts the existing generated configuration. It does not regenerate YAML or install changed dependencies; push a commit for that. Swarm restarts wait up to 60 seconds for teardown and abort on timeout or query failure. Per-service Swarm restart uses `docker service update --force`, avoiding full stack teardown; Compose uses `restart` for the selected services.
 
-## Traefik routing
+For the forced SSH key installed by Kata, the Makefile recipe is:
 
-Kata generates Traefik labels automatically. You do not add a `traefik:` block.
-
-Defaults:
-
-- Router name: `<app>-websecure`
-- Host rule: `${DOMAIN_NAME:-<app>.localhost}`
-- Entry points: `websecure` (with an automatic `web` → `websecure` redirect)
-- Service port: first declared `ports`/`expose` entry; otherwise Kata assumes `8000` — ensure the service actually listens there or set `traefik.http.services.<name>.loadbalancer.server.port`
-- TLS: enabled; certificates stored in volume `traefik-acme`
-- Network: external Docker network `traefik-proxy`
-
-Kata enforces a single shared Traefik per host. It creates/reuses `traefik-proxy` and `traefik-acme` and starts or reuses a container named `kata-traefik`. If you already run Traefik, attach it to that network/volume and Kata will reuse it.
-
-Override via labels on your service, e.g.:
-
-```yaml
-services:
-  web:
-    labels:
-      traefik.http.routers.websecure.rule: Host(`app.example.com`)
-      traefik.http.routers.websecure.entrypoints: websecure
-      traefik.http.routers.websecure.tls: "true"
-      traefik.http.middlewares.web-redirect.redirectscheme.scheme: https
-      traefik.http.routers.websecure.middlewares: web-redirect
-      traefik.http.services.web.loadbalancer.server.port: "5000"
+```makefile
+deploy: deploy-production
+	ssh -t kata@$(PRODUCTION_SERVER) restart $(APP_NAME) builder --logs
 ```
 
-CLI helpers:
+A regular SSH shell account needs `kata` before `restart`. `--logs` follows the last named service after a successful restart using `--tail 0`; output emitted before log following starts may be missed. Use a separate `logs --tail 100` call when early builder output matters.
 
-- `kata config:traefik APP [--json]` — render generated labels/config
-- `kata traefik:ls` — list routers/services
-- `kata traefik:inspect APP` — show labels per service
+## Finding services and running commands
 
-## Deployment modes: compose vs swarm
+```bash
+kata services APP
+kata containers APP web
+kata ps APP
+kata ps APP web
+kata run APP web sh
+kata run --index 1 APP web sh
+kata logs APP web --tail 100 -f
+```
 
-- Default: `swarm` if Docker Swarm is active; otherwise `compose`.
-- Override per app: add `x-kata-mode: compose|swarm` or run `kata mode APP compose|swarm` (persists in `.kata-mode`).
-- Secrets are Swarm-only; without Swarm, secrets commands will fail.
+`containers` and `run` resolve running containers on the local Docker daemon using labels. They do not connect to other Swarm nodes. `--index` is a zero-based index in the returned Docker list, not a stable Swarm replica slot. Use `ps` to see remote task placement. No match is an error for `run`; raw names require explicit `kata docker exec`.
 
-## Deploying your app
+`run` allocates a TTY only when stdin and stdout are terminals. Use `--` to separate Kata options from commands with their own options, for example `kata run -- APP web sh -c 'echo hello'` locally. The forced SSH command's argument splitting is not a general shell quoting protocol; use simple arguments or an application script over that path.
 
-Option A: Git push
+Swarm logs require a service name; Compose logs may cover the entire app. Swarm app-wide `ps` uses `docker stack ps`. `ls` retains a legacy name-prefix running marker and is not reliable for Swarm; prefer `services` and `ps`.
 
-- Ensure SSH is set up with `kata setup:ssh ...`.
-- Add remote `user@host:APP` and push. Kata clones to `APP_ROOT/APP`, parses `kata-compose.yaml`, generates Traefik labels, selects mode, and starts the stack.
+## Configuration and modes
 
-Option B: Manual work tree
+```bash
+kata config:stack APP
+kata config:docker APP
+kata config:traefik APP --json
+kata traefik:ls APP
+kata traefik:inspect APP
+kata mode APP
+kata mode APP compose
+```
 
-- Place code and `kata-compose.yaml` in `APP_ROOT/APP`.
-- Deploy by running `kata restart APP` (or `kata git-hook APP` with a synthetic ref update).
+`config:stack` displays the source YAML. `config:docker` displays generated YAML. Rendering Traefik configuration can invoke parsing and runtime preparation, so it is not guaranteed read-only.
 
-Generated file: `APP_ROOT/APP/.docker-compose.yaml` (regenerated on deploy).
+Mode changes stop the old deployment before saving the new mode. Swarm teardown must finish before starting Compose. A failed new start retains the new mode for recovery, without automatic rollback. For a lasting choice across Git deployments, set `x-kata-mode` in the source YAML: deployment recalculates the mode and can overwrite a CLI-only choice.
 
-## Command reference
+Environment precedence is base paths/PUID/PGID, top-level environment, config `ENV`, config `.env`, then service environment. Both config files are loaded if present. See the spec for parser limitations; container processes should listen on `0.0.0.0` when another container must reach them.
 
-- `ls` — list deployed apps (asterisk indicates running)
-- `config:stack APP` — show `kata-compose.yaml`
-- `config:docker APP` — show generated `.docker-compose.yaml`
-- `config:traefik APP` — show generated Traefik labels/config
-- `traefik:ls` — list routers/services
-- `traefik:inspect APP` — show labels per service
-- `restart APP` — restart the app
-- `stop APP` — stop the app
-- `rm [-w|--wipe] APP` — remove app (and optionally wipe data/config)
-- `mode APP [compose|swarm]` — get/set app mode and restart to apply
-- `docker ...` — pass-through to Docker CLI (logs, ps, exec, etc.)
-- `docker:services STACK` — list services in a Swarm stack
-- `ps SERVICE...` — `docker service ps` for Swarm services
-- `run SERVICE CMD...` — `docker exec -ti` into a running container
-- `secrets:set/ls/rm` — manage Swarm secrets
-- `setup` — create Kata root folders
-- `setup:ssh FILE|-` — add SSH key for git deploys
-- `update` — update `kata.py` from reference URL
-- `help` — CLI help
+## Routing
 
-## Logs and troubleshooting
+Routing labels are opt-in through a nonempty `traefik:` block:
 
-- Compose: `docker compose -f APP_ROOT/APP/.docker-compose.yaml logs -f`
-- Swarm: `docker service ps APP_web` then `docker logs <container>`
-- Generic: `kata docker logs <container>` (pass-through)
+```yaml
+traefik:
+  host: app.example.com
+  service: web
+  port: 8000
+  entrypoints: [websecure]
+  enable_http_redirect: true
+```
 
-Common issues:
+The port defaults to 8000, not the first exposed port. TLS defaults on when `websecure` is selected. No redirect is generated unless requested. The selected service joins the proxy network unless it uses `network_mode`. Kata does not publish application ports automatically.
 
-- `caddy:` present: now errors. Remove it and rely on Traefik defaults/labels.
-- Port not reachable: check mode (Swarm ignores loopback binds); force compose if needed. Ensure your service declares `ports` or `expose` if Traefik should reach it.
-- Traefik missing: start Traefik yourself or let Kata inject the minimal service; ensure `traefik-proxy` and `traefik-acme` exist.
-- Secrets error: initialize Swarm or avoid secrets commands.
-- Runtime install problems: ensure `requirements.txt` or `package.json` exists; inspect build output.
+The shared Traefik bootstrap runs on deployment even when label generation is disabled. Existing proxy compatibility and multi-node Swarm routing need explicit checking; neither labels nor an ACME volume alone guarantees HTTPS. The `caddy:` key is rejected.
 
-## Environment variables available to services
+## Secrets, runtime images and updates
 
-Provided to each service unless overridden:
+```bash
+kata secrets:set TOKEN=@/path/to/token
+kata secrets:set TOKEN=-
+kata secrets:ls
+kata secrets:rm TOKEN
+kata runtime:rebuild python
+kata runtime:rebuild-all
+kata runtime:clean
+kata update --no-restart
+```
 
-- PUID, PGID
-- APP_ROOT, DATA_ROOT, CONFIG_ROOT, ENV_ROOT, GIT_ROOT, LOG_ROOT (app-specific paths)
+Secret file/stdin bytes are preserved. Names allow letters, digits, `.`, `_` and `-`, starting with a letter or digit. `NAME=value` treats an existing path as a file for compatibility; use `@file` to be explicit. Avoid literal secrets on the command line. Creation requires a Swarm manager and fails non-zero; legacy list/removal precondition warnings are not a universal exit-status contract.
 
-Merge order (later wins): base → top-level `environment:` → `ENV` / `.env` → service env.
+Runtime images are reused until rebuilt or removed. Runtime preparation runs on deployment and failures abort it. Tags and apt packages are not frozen: reproducible builds need a maintained image/snapshot policy. The updater validates syntax, requires a backup, preserves mode bits and uses an atomic replacement; it trusts the upstream repository.
 
-## Uninstalling an app
+## Removing an app
 
-- Stop and remove: `kata rm APP`
-- Add `--wipe` to also remove `DATA_ROOT/APP` and `CONFIG_ROOT/APP`.
+```bash
+kata rm APP
+kata rm APP --wipe
+```
+
+Removal normally deletes code, runtime state, logs and the bare repository, while retaining data/config. `--wipe` includes data/config; `--force` skips confirmation. Kata rejects redirected per-app paths before teardown and waits for Swarm teardown before deleting directory contents in a root BusyBox container. Container or host deletion failures exit non-zero and do not report success. A failed removal can still be partial; keep backups.
+
+Docker access is administrative access. These checks do not provide hostile multi-tenant isolation or protect against a concurrent privileged process changing paths. Do not run the development-only `tools/updater.py` HTTP upload server on an exposed host.
+
+## Tests and troubleshooting
+
+Activate a Python environment with `click` and `pyyaml`, then run `make test` or `python -m unittest discover -s tests`. Tests mock Docker unless stated otherwise; see the [verification notes](SPEC.md#verification-and-remaining-limits).
+
+For deployment failures, inspect `ps`, service logs and the generated YAML before retrying. For TLS, check DNS, entrypoints and the proxy's own logs. For Swarm, local runtime images and bind-mounted app files must exist on whichever node receives the task; Kata does not distribute them.

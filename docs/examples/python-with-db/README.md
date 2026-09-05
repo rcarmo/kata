@@ -8,15 +8,18 @@ Shows how to keep a database on an internal network while letting Traefik reach 
 - `app.py` — FastAPI app returning DB connection info (no migrations/ORM)
 - `requirements.txt` — runtime dependencies
 
-## How to try
+## Deploying this example
 
-1. Ensure Kata is set up on the host: `kata setup`
-2. Copy this folder to your Kata apps directory (replace APP with your app name):
-   - `cp -a docs/examples/python-with-db "$HOME/app/APP"`
-3. Deploy:
-   - `echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/main" | kata git-hook APP`
-   - Or `kata restart APP` if the app dir already exists
-4. Open https://app.localhost/ (change the host in the `traefik` block if needed).
+Follow the [first-deployment instructions](../../INSTALL.md#first-deployment),
+copying this directory into a separate Git repository and pushing it to the
+configured Kata account. Edit `kata-compose.yaml` before pushing: choose a mode,
+hostname and appropriate credentials. `restart` requires an already generated
+`.docker-compose.yaml`; copying this folder into `app/APP` is not enough.
+
+The `.localhost` hostnames are placeholders, not automatically trusted HTTPS
+endpoints. For local testing select `entrypoints: [web]`, `tls: false` and disable
+HTTP redirects. Public HTTPS needs real DNS, ACME configuration and reachable
+ports. See the [manual](../../MANUAL.md#routing).
 
 Notes
 

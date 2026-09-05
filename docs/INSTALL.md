@@ -1,89 +1,80 @@
-# Installation Guide for Kata
+# Installing Kata
 
 ![Kata logo](kata-256.png)
 
-Kata is a lightweight wrapper around Docker (Compose or Swarm) with implicit Traefik routing. These steps target a fresh Linux host or macOS with Docker Desktop.
+Use a dedicated deployment account on a trusted host. Access to the Docker daemon is administrative access; Kata's forced SSH command is not a tenant security boundary.
 
-## Prerequisites
+## Dependencies
 
-- Docker 20.10+ (Swarm optional; Compose is used if Swarm is inactive)
-- Python 3.12+
-- Git, curl
+Install Python 3.12 or newer, Git, OpenSSH, curl and Docker. Compose deployments need the `docker compose` plugin (the legacy `docker-compose` binary is a fallback). Swarm deployments need an active manager. Kata does not initialise Swarm for you.
 
-Optional but recommended for HTTPS:
-
-- Traefik v3 (containerized). Kata expects or will create:
-  - external Docker network `traefik-proxy`
-  - Docker volume `traefik-acme` for certificates
-
-## Install Kata
-
-1. Download the script (adjust URL as needed):
+The Python dependencies are `click` and `pyyaml`. Use a virtual environment rather than modifying a distribution-managed Python installation:
 
 ```bash
-curl -o kata.py https://raw.githubusercontent.com/piku/kata/master/kata.py
-chmod +x kata.py
-mkdir -p ~/bin
-mv kata.py ~/bin/
-```
-
-Ensure `~/bin` is on your `PATH` (e.g., add `export PATH="$HOME/bin:$PATH"` to your shell rc file).
-
-2. Run the initial setup to create directories under `~/.kata` (or `$KATA_ROOT`):
-
-```bash
+python3 -m venv "$HOME/.local/share/kata-venv"
+"$HOME/.local/share/kata-venv/bin/pip" install click pyyaml
+mkdir -p "$HOME/bin" "$HOME/.local/lib/kata"
+curl -fL https://raw.githubusercontent.com/rcarmo/kata/main/kata.py \
+  -o "$HOME/.local/lib/kata/kata.py"
+chmod 755 "$HOME/.local/lib/kata/kata.py"
+cat > "$HOME/bin/kata" <<'SH'
+#!/bin/sh
+exec "$HOME/.local/share/kata-venv/bin/python" "$HOME/.local/lib/kata/kata.py" "$@"
+SH
+chmod 755 "$HOME/bin/kata"
+export PATH="$HOME/bin:$PATH"
 kata setup
 ```
 
-3. (Optional) Add your SSH public key so you can deploy via `git push`:
+Persist the PATH setting in your shell configuration. `KATA_ROOT` defaults to `$HOME`, not `~/.kata`; `setup` creates `app`, `data`, `config`, `envs`, `logs` and `repos` there. Set `KATA_ROOT` before setup if you want a different root.
+
+## SSH deployment
+
+Install the client's public key on the deployment host:
 
 ```bash
-kata setup:ssh ~/.ssh/id_rsa.pub
+kata setup:ssh /path/to/client-key.pub
 ```
 
-## Provision shared Traefik (once per host)
+The generated forced command invokes `kata.py` directly. Its shebang uses `python3` from the SSH session's PATH, not the wrapper above. Ensure that Python has `click` and `pyyaml` available in that non-interactive environment before using Git pushes. With the virtual environment above, an administrator can point the forced command at its absolute Python interpreter followed by the absolute script path. Keep the generated forwarding restrictions.
 
-Kata enforces a single Traefik per host. It will create `traefik-proxy` / `traefik-acme` and start or reuse a container named `kata-traefik` automatically when you deploy. If you prefer to start it yourself (or run a custom Traefik), launch it attached to the shared network/volume:
+Use a dedicated key. For a forced-command key, commands are Kata arguments:
 
 ```bash
-docker network create traefik-proxy || true
-docker volume create traefik-acme || true
-docker run -d --name kata-traefik --restart unless-stopped \
-	--network traefik-proxy \
-	-p 80:80 -p 443:443 \
-	-v /var/run/docker.sock:/var/run/docker.sock:ro \
-	-v traefik-acme:/etc/traefik \
-	traefik:v3.6.5 \
-	--providers.docker=true \
-	--providers.docker.exposedbydefault=false \
-	--entrypoints.web.address=:80 \
-	--entrypoints.websecure.address=:443 \
-	--certificatesresolvers.default.acme.email=${KATA_ACME_EMAIL:-admin@example.com} \
-	--certificatesresolvers.default.acme.storage=/etc/traefik/acme.json \
-	--certificatesresolvers.default.acme.httpchallenge.entrypoint=web
+ssh kata@paas help
+ssh kata@paas restart hello web
 ```
 
-If you already run Traefik, keep it attached to `traefik-proxy` and `traefik-acme` and Kata will reuse it; otherwise it will start `kata-traefik` for you during deploy.
+For a regular shell account, include the executable: `ssh user@host kata restart hello web`.
 
-## Deploy your first app
+## First deployment
 
-1. Copy an example app:
+Clone this repository on your workstation, copy an example into a separate repository, and push it to the configured deployment account:
 
 ```bash
-cp -a docs/examples/minimal-python "$HOME/app/hello"
+git clone https://github.com/rcarmo/kata.git
+cp -R kata/docs/examples/minimal-python hello
+cd hello
+# Edit kata-compose.yaml: choose a real hostname and deployment mode.
+git init -b main
+git add .
+git commit -m 'Initial app'
+git remote add paas kata@paas:hello
+git push paas main
 ```
 
-2. Deploy:
+The push creates the bare repository and generates `.docker-compose.yaml`. `restart` only operates on an already generated deployment; copying an example into `app/hello` and running `restart` is not an initial deployment procedure.
+
+The examples' `.localhost` names are placeholders. They do not provision trusted certificates. For public HTTPS, configure a real hostname, DNS, ACME email and reachable ports 80/443. For local testing use `entrypoints: [web]`, `tls: false` and no redirect, or supply your own TLS configuration.
+
+## Traefik and updates
+
+Routing labels require a nonempty `traefik:` block with `host`. Deployment currently calls shared Traefik setup even without routing enabled, so it may create `traefik-proxy`, `traefik-acme` and `kata-traefik`. See the [specification](SPEC.md) before integrating an existing proxy or a multi-node Swarm.
 
 ```bash
-kata restart hello
+kata update --no-restart
 ```
 
-3. Browse to `https://hello.localhost/` (self‑signed locally). If using a real domain, set `DOMAIN_NAME` in your `kata-compose.yaml` and ensure DNS points to this host.
+The updater follows HTTPS redirects, checks Python syntax, saves `.backup`, preserves permissions and replaces the script atomically. Without `--no-restart`, it re-executes the new script to display help. This trusts upstream source; syntax checking is not signature verification. Keep the script directory writable by the deployment account.
 
-## Troubleshooting
-
-- `kata config:traefik <app> --json` to inspect generated labels
-- `kata traefik:ls` to see routers/services
-- Confirm Docker network `traefik-proxy` exists and Traefik is attached to it
-- If ports are missing, add `expose` or `ports` to the service so Traefik has a target port
+See the [manual](MANUAL.md) for operations and the [README](../README.md) for examples.

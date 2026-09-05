@@ -8,15 +8,18 @@ A tiny JSON endpoint powered by Bun using Kata’s `runtime: bun` shortcut.
 - `index.ts` — Bun server with a single route
 - `package.json` — present so the runtime hook can run `bun install`
 
-## How to try
+## Deploying this example
 
-1. Ensure Kata is set up on the host: `kata setup`
-2. Copy this folder to your Kata apps directory (replace APP with your app name):
-   - `cp -a docs/examples/minimal-bun "$HOME/app/APP"`
-3. Deploy using the internal hook (or push via git if you set that up):
-   - `echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/main" | kata git-hook APP`
-   - Or simply run `kata restart APP` if the app dir already exists
-4. Open https://app.localhost/ (change the host in the `traefik` block if needed).
+Follow the [first-deployment instructions](../../INSTALL.md#first-deployment),
+copying this directory into a separate Git repository and pushing it to the
+configured Kata account. Edit `kata-compose.yaml` before pushing: choose a mode,
+hostname and appropriate credentials. `restart` requires an already generated
+`.docker-compose.yaml`; copying this folder into `app/APP` is not enough.
+
+The `.localhost` hostnames are placeholders, not automatically trusted HTTPS
+endpoints. For local testing select `entrypoints: [web]`, `tls: false` and disable
+HTTP redirects. Public HTTPS needs real DNS, ACME configuration and reachable
+ports. See the [manual](../../MANUAL.md#routing).
 
 Notes:
 

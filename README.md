@@ -20,7 +20,8 @@
 Mandatory:
 
 - **Docker** 20.10+ (Swarm optional; if inactive, Compose mode is used)
-- **Python** 3.12+ (to run `kata.py`)
+- **Python** 3.12+ with `click` and `pyyaml`
+- **Git** and OpenSSH for push deployments; the Compose plugin for Compose mode
 
 Optional (HTTP routing via Traefik):
 
@@ -28,11 +29,11 @@ Optional (HTTP routing via Traefik):
 
 > systemd / Podman are **not** required by the current code path (earlier design notes referenced them).
 
-Tested on Debian 12/13, recent Ubuntu, and macOS with Colima/Docker Desktop.
+See [installation](docs/INSTALL.md), the [operating manual](docs/MANUAL.md), and [verification limits](docs/SPEC.md#verification-and-remaining-limits). The implementation stays single-file.
 
 ## Traefik Routing
 
-Traefik is **opt-in**. If you do not provide a `traefik:` block, Kata will not add labels or inject Traefik. Add a `traefik` block to the root of your `kata-compose.yaml` to enable routing.
+Traefik is **opt-in**. Without a nonempty `traefik:` block, Kata does not generate routing labels. Deployment still calls shared Traefik setup, which may start a proxy even for an unrouted app. Add a `traefik` block to the root of your `kata-compose.yaml` to enable routing.
 
 You can always add Traefik labels manually on any service; the `traefik` block is just a convenience that generates a consistent set of labels for one target service.
 
@@ -41,7 +42,7 @@ Key defaults (when `traefik` is provided):
 - Router name: `<app>`
 - Host rule: `traefik.host` (required)
 - Entry points: `websecure` by default; `web` → `websecure` redirect only if you set `enable_http_redirect`
-- Service: `traefik.service` (defaults to the first service listed if omitted); declare `ports`/`expose` and set `traefik.port` if it differs from the declared port (defaults to 8000 if unset)
+- Service: `traefik.service` (defaults to the first service listed if omitted); set `traefik.port` to the actual container listen port (defaults to 8000; it is not inferred from `ports`/`expose`)
 - TLS: enabled by default when using `websecure`; certificates stored in the external volume `traefik-acme`
 - Network: only the Traefik-targeted service is attached to the external Docker network `traefik-proxy`; other services are untouched
 
@@ -62,20 +63,20 @@ services:
 
 #### Service with no exposed port (not routed)
 
-If a service does not declare `ports` or `expose`, Traefik will not be able to reach it. This is fine for workers/cron jobs:
+Traefik needs a reachable listening socket, a shared network and the correct upstream port. `expose` documents that port; it is not an access-control boundary. This is fine for workers/cron jobs:
 
 ```yaml
 services:
   worker:
     image: busybox
     command: ["sh", "-c", "echo worker started; sleep infinity"]
-    # No ports/expose → not routable via Traefik
+    # Do not select this worker as the Traefik target
 ```
 
 ### Inspecting Traefik config
 
 - `kata config:traefik <app> [--json]` — render generated labels and router/service rules
-- `kata traefik:ls` — list routers/services for the generated stack
+- `kata traefik:ls <app>` — list routers/services for the generated stack
 - `kata traefik:inspect <app>` — show labels per service
 
 ### Static runtime
@@ -125,12 +126,12 @@ Compose list form (`["KEY=VALUE", "BARE_KEY"]`) is normalized; bare keys default
 Recommended to set:
 
 - `PORT` (service listen port, especially for reverse proxying)
-- `BIND_ADDRESS` (default `127.0.0.1` if omitted in your own config logic)
+- `BIND_ADDRESS` (application-defined; use `0.0.0.0` for container-to-container access)
 - `DOMAIN_NAME` (for host matchers / TLS)
 
 Declare `ports` or `expose` on the service you want Traefik to reach; Kata no longer adds these automatically. If you prefer a different target, set `traefik.service` (and `traefik.port` if it differs from the declared port).
 
-Automatically injected into each service unless already set: the base variables above.
+Base variables are merged during service normalisation. Current limitation: non-static services without an explicit `command` skip that normalisation; see the spec.
 
 For more details on Traefik labels, see the [Traefik reference](https://doc.traefik.io/traefik/routing/routers/).
 
@@ -145,7 +146,7 @@ kata config:traefik <app> --json
 - List routers/services for your stack:
 
 ```bash
-kata traefik:ls
+kata traefik:ls APP
 ```
 
 - Typical errors:
@@ -218,7 +219,7 @@ kata secrets:ls
 kata secrets:rm NAME
 ```
 
-They are disabled (with a warning) when Swarm is inactive.
+Secrets require a Swarm manager. Creation validates names before reading input, preserves binary file/stdin data, and fails non-zero. Avoid putting literal secret values in shell history.
 
 ### Git Deployment
 
@@ -254,13 +255,21 @@ Selected commands (run `kata help` for full output):
 | run <app> <service> <cmd...> | Autodetect the container and exec into it |
 | update                       | Self‑update `kata.py` from upstream (validates, backs up, re-execs) |
 
+### SSH operations
+
+For a forced-command deployment key, use `ssh kata@paas restart APP builder --logs`.
+For a regular shell account, use `ssh user@host kata restart APP builder --logs`.
+`restart` needs an existing generated deployment; first deploy with Git, not by
+copying an example and restarting it. `run` resolves local containers only and
+supports non-interactive SSH without forcing a TTY.
+
 ### Testing
 
 ```bash
 make test
 ```
 
-The test suite covers small, dependency-light helpers such as Docker object-name validation and Swarm stack-drain behavior.
+Use an environment with `click` and `pyyaml` installed. The 27 regression tests cover lifecycle failures, cleanup guards, binary secrets, mode ordering, updater replacement and SSH exit status. Live Compose/Swarm lifecycle verification remains outstanding; see the spec.
 
 ---
 

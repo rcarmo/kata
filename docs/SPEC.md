@@ -4,11 +4,11 @@
 
 > This document reflects **what `kata.py` implements today** and the **near-term design direction**. It is the single, consolidated spec for Kata; where it disagrees with `kata.py`, the code is authoritative and this document should be corrected.
 
-## Overview
+## Deployment model
 
 Kata is a single-file (`kata.py`, Python 3.12+) micro-PaaS — a Piku-style refactor — that deploys applications from git pushes (or manual triggers) onto Docker, using either **Swarm stacks** or **Compose**, with optional implicit HTTP(S) routing through **Traefik**.
 
-The pipeline is: parse a `kata-compose.yaml` → merge environment → ensure runtime images → generate a `.docker-compose.yaml` → deploy via Swarm/Compose → (optionally) generate Traefik labels for one target service.
+The pipeline is: parse a `kata-compose.yaml` → merge environment → ensure runtime images → generate a `.docker-compose.yaml` → generate optional Traefik labels → deploy via Swarm/Compose.
 
 Key properties:
 
@@ -46,7 +46,7 @@ Key properties:
    - A top-level `traefik:` block generates labels for one target service and attaches it to the external `traefik-proxy` network
    - Kata ensures/reuses a shared `kata-traefik` container, the `traefik-proxy` network, and the `traefik-acme` volume
 6. **Secrets (Swarm only)**
-   - Thin passthrough to `docker secret` (`secrets:set|ls|rm`), gated by Swarm detection (warns and no-ops otherwise)
+   - Thin passthrough to `docker secret` (`secrets:set|ls|rm`), gated by Swarm detection (creation fails without a manager; legacy list/removal preconditions warn)
 
 ## Directory Structure
 
@@ -58,7 +58,7 @@ Rooted at `$KATA_ROOT` (default `$HOME`). Note the **singular** directory names:
 | `data/<app>` | Persistent data | `/data` |
 | `config/<app>` | Config overrides (`ENV` / `.env`) | `/config` |
 | `envs/<app>` | Virtual env / runtime state | `/venv` |
-| `logs/<app>` | Reserved (not actively written by kata.py) | `/logs` |
+| `logs/<app>` | Reserved (not actively written by kata.py) | no default mount |
 | `repos/<app>` | Bare git repo (push target) | — |
 
 Generated per deployment: `app/<app>/.docker-compose.yaml` (regenerated each deploy). Per-app mode persisted in `app/<app>/.kata-mode`.
@@ -82,8 +82,8 @@ A top-level `caddy:` key is rejected with an error.
 - `runtime: python|nodejs|php|bun|static` — Kata supplies `image: kata/<runtime>` and default mounts, and runs runtime prep. Deleted from the generated service.
 - `static: true` (shorthand) — sets `image: kata/static`, defaults `PORT=8000`, `DOCROOT=/app`.
 - If you supply `image:` yourself, **no** runtime automation runs.
-- If a service omits `volumes:`, Kata injects `["app:/app", "config:/config", "data:/data", "venv:/venv"]`. Custom volumes are honored (with a warning).
-- A service with neither `image` nor `runtime` and no `command` triggers a warning and is skipped for command handling.
+- On the no-`image` path, if a service omits `volumes:`, Kata injects `["app:/app", "config:/config", "data:/data", "venv:/venv"]`. Custom volumes are honored (with a warning).
+- A non-static service without `command` triggers a warning and skips environment normalisation.
 
 ### Environment forms
 
@@ -101,7 +101,7 @@ Provide a `traefik:` block to generate a consistent set of labels for **one** ta
 traefik:
   host: app.example.com        # required (traefik.host)
   service: web                 # optional; defaults to first service listed
-  port: 8000                   # optional; defaults to declared port, else 8000
+  port: 8000                   # optional; defaults to 8000; not inferred
   enable_http_redirect: false  # optional; web → websecure redirect
 ```
 
@@ -133,7 +133,7 @@ Order of precedence (last wins):
 
 1. Base variables: `PUID`, `PGID`, and per-app root paths (`APP_ROOT`, `DATA_ROOT`, `ENV_ROOT`, `CONFIG_ROOT`, `GIT_ROOT`, `LOG_ROOT`)
 2. Top-level `environment:` in `kata-compose.yaml`
-3. `ENV` or `.env` in `config/<app>`
+3. `ENV`, then `.env`, in `config/<app>` (both are loaded if present)
 4. Service-level `environment` (list or mapping)
 
 During normalization, list form is converted to a mapping and base variables are added to a service only if not already defined there.
@@ -174,8 +174,8 @@ echo "0000000000000000000000000000000000000000 $(git rev-parse HEAD) refs/heads/
 | `runtime:rebuild-all` / `runtime:rebuild <rt>` / `runtime:clean` | Manage runtime images |
 | `docker …` | Passthrough to `docker` |
 | `docker:services <stack>` | `docker stack services` |
-| `ps <app> [service…]` | Tasks for an app/services (Swarm `service ps`, else `compose ps`) |
-| `run <app> <service> [--index N] <cmd…>` | Autodetect the container and `docker exec -ti` into it |
+| `ps <app> [service…]` | Tasks for an app/services (Swarm `stack ps` or selected `service ps`, else `compose ps`) |
+| `run <app> <service> [--index N] <cmd…>` | Autodetect the container and `docker exec -i` (plus `-t` for terminals) into it |
 | `scp …` | Passthrough to `scp` |
 | `update [--force] [--no-restart]` | Self-update `kata.py` from upstream: follows redirects, validates the download compiles, writes a `.backup`, replaces atomically, and re-execs |
 | `help` | Show CLI help |
@@ -201,7 +201,7 @@ For full-app restarts in Swarm mode, Kata waits for `docker stack rm` teardown t
 ## Logging (Current)
 
 - Kata prints to stdout/stderr
-- Container logs via `docker` / `kata docker logs …`; no integrated aggregation. `logs/<app>` is reserved but not written by kata.py.
+- Container logs via `kata logs APP [SERVICE]` or Docker passthrough; no integrated aggregation. `logs/<app>` is reserved but not written by kata.py.
 
 ---
 
@@ -223,7 +223,7 @@ That now collapses to one line:
 
 ```makefile
 deploy: deploy-production
-	ssh -t kata@$(PRODUCTION_SERVER) kata restart $(APP_NAME) builder --logs
+	ssh -t kata@$(PRODUCTION_SERVER) restart $(APP_NAME) builder --logs
 ```
 
 ### Resolution primitive
@@ -244,7 +244,7 @@ This primitive backs `run` and `containers`.
 | `services <app>` | List logical services for an app (Swarm `stack services`, else `compose ps`). |
 | `containers <app> [service]` | Resolve and print concrete container IDs/names/status (the autodetect primitive). |
 | `logs <app> [service]` | Tail logs, mode-aware (`-f/--follow`, `--tail`). Swarm requires a service; Compose accepts app-wide or per-service. |
-| `run <app> <service> [--index N] <cmd...>` | Resolve the container for `(app, service)` (replica `N`) and `docker exec -ti` into it. Fails when no local container resolves; use explicit `docker exec` passthrough for raw names. This avoids accidentally executing in an unrelated container. |
+| `run <app> <service> [--index N] <cmd...>` | Resolve the container for `(app, service)` (replica `N`) and `docker exec -i` (plus `-t` for terminals) into it. Fails when no local container resolves; use explicit `docker exec` passthrough for raw names. This avoids accidentally executing in an unrelated container. |
 
 Under Swarm, restarts use `docker service update --force` (cluster-aware, rolling) rather than killing individual task containers; container-level `exec` is reserved for `run`/debugging.
 
@@ -256,47 +256,65 @@ Multi-node SSH fan-out, log aggregation, and replica scaling commands remain non
 
 This document should be updated alongside code changes; discrepancies mean the code is authoritative.
 
-## Audit hardening (September 2026)
+## Failure handling and verification
 
-- Lifecycle CLI failures return non-zero where explicitly checked; broad subprocess
-  error propagation remains under review.
-- Mode changes stop and drain the old deployment before persisting the new mode.
-  A failed new start retains the selected mode for recovery, not automatic rollback.
-- Secret file/stdin bytes are preserved without lossy UTF-8 decoding. Names are
-  validated before input is read, and creation failures exit non-zero.
-- Git post-receive deployments hold an exclusive per-app `flock` on
-  `repos/<app>/kata-deploy.lock`, outside the resettable working tree. Deleted refs
-  are skipped; failed clone/fetch/reset/submodule commands stop deployment.
-  This lock serializes post-receive hooks, not all lifecycle commands.
-- Self-update uses a unique same-directory temporary file, preserves file permissions,
-  and requires a successful backup before replacement. Syntax validation is not
-  signature verification: the upstream repository remains a trusted code source.
+Lifecycle helpers return booleans where documented; CLI wrappers fail non-zero
+for checked operations. `checked_call` preserves command failures for SSH/Make.
+Legacy warning-only paths remain, so this is not a claim that every CLI error
+returns non-zero. Runtime setup/rebuild/cleanup failures are checked.
 
-Cleanup rejects invalid app names rather than rewriting them. Before stopping an
-app, it rejects redirected (symlinked) per-app paths. The root cleanup container
-removes directory contents, including dotfiles, without attempting to unlink bind
-mount roots. Failed container or host deletion exits non-zero and does not report
-success. This path validation is defense in depth, not protection against a
-concurrent hostile administrator changing paths after validation; Kata assumes a
-trusted deployment account with Docker access.
+Git post-receive deployments hold an exclusive per-app `flock` on
+`repos/<app>/kata-deploy.lock`. Failed Git preparation stops deployment and deleted
+refs are skipped. There is no branch allowlist; the lock covers hooks, not manual
+lifecycle commands. Mode changes stop and drain the old deployment before saving
+the new mode; a failed new start retains that mode for recovery. Git deployment
+recalculates the mode from host state and `x-kata-mode`, rather than preserving a
+CLI-only selection indefinitely.
 
-SSH command hardening: `run`, `logs`, `services`, `docker:services`, and `ps`
-propagate subprocess failures through a shared checked-call helper. `run` only
-requests a TTY when stdin and stdout are terminals. App-wide Swarm `ps` uses
-`docker stack ps`, not a nonexistent service named after the stack.
+Secret creation validates names before reading input and preserves bytes from
+files/stdin. An existing bare path in `NAME=value` still means a file. File/value
+errors are not printed verbatim. Secret names allow `[A-Za-z0-9][A-Za-z0-9_.-]*`;
+app names allow `[A-Za-z0-9][A-Za-z0-9_-]*` and are rejected rather than rewritten.
 
-Verification on 2026-09-05: 23 mocked regression tests passed. An isolated Alpine
-container with Compose-compatible labels verified discovery, non-interactive exec,
-and exit-status propagation against Docker 29.1.3; it was removed afterward.
-The test host has no Compose plugin and Swarm is inactive, so live Compose and
-Swarm lifecycle tests remain unverified; no host orchestration configuration was
-changed. Package pinning is not applied blindly: frozen apt versions can prevent
-security updates and require a maintained snapshot/refresh policy. Runtime image
-reproducibility remains a documented operational follow-up, not a claim of this audit.
+Removal rejects redirected per-app paths before teardown, waits for Swarm removal,
+and deletes contents (including dotfiles) in a root BusyBox container before host
+cleanup. Failures can leave partial deletion, but never report successful removal.
+These checks assume a trusted deployment account; Docker access is administrative
+access, and concurrent privileged path changes are outside this protection.
 
-Additional runtime/SSH checks: image removal returns Docker failure status;
-rebuild/clean commands fail non-zero rather than claiming success. Runtime setup
-commands are checked. Temporary Dockerfile creation failures do not mask the
-original error with an uninitialized cleanup path. Git-shell and SCP passthrough
-use checked argv calls; SSH fingerprint lookup no longer interpolates a filename
-into a shell command. Regression suite: 27 tests passing.
+Self-update follows HTTPS redirects, checks Python syntax, requires a backup,
+preserves permissions and replaces a unique same-directory temporary file
+atomically. It re-executes to show help unless `--no-restart` is given. Syntax
+validation does not authenticate the downloaded script: upstream is trusted.
+
+### Parser and routing limitations
+
+* Default service mounts are added only on the no-`image` path. Explicit images
+  need explicit mounts. `static: true` sets an image early and does not take the
+  runtime build/mount path; prefer `runtime: static`.
+* A non-static service without `command` skips environment normalisation, even
+  when its image has a valid default command. Supplying both `image` and `runtime`
+  skips runtime preparation but currently leaves the `runtime` key in output.
+* `apply_traefik` defaults its port directly to 8000, not to a declared exposed
+  port. Rendering config can run parsing/runtime preparation and create folders.
+* Label generation is opt-in, but `do_deploy` calls shared Traefik bootstrap
+  unconditionally. No routing block does not guarantee no proxy side effects.
+* Swarm deployment requires a manager. Lifecycle fallback tests manager availability,
+  while fresh deployment checks active Swarm state. Use an explicit mode on mixed
+  hosts. Local images and bind-mounted data are not distributed across nodes.
+* Generated YAML is a Compose-like pass-through, not a full schema validator.
+  Review it for the selected orchestrator, including Traefik's provider and labels.
+
+### Verification and remaining limits
+
+On 2026-09-05, 27 mocked regression tests passed. An isolated Alpine container with
+Compose-compatible labels verified local discovery, non-interactive exec and
+failure exit status against Docker 29.1.3, and was removed afterward. The test host
+has no Compose plugin and Swarm is inactive; live Compose/Swarm lifecycle tests and
+concurrent-push contention tests remain unverified. No production services or host
+orchestration configuration were changed.
+
+Runtime tags and apt packages are not pinned. Reproducible builds need a maintained
+snapshot/image refresh policy rather than arbitrarily frozen packages. The audit
+is not a production-security certification. The development-only HTTP uploader
+in `tools/updater.py` must not be exposed on an untrusted network.
