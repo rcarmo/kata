@@ -269,7 +269,7 @@ supports non-interactive SSH without forcing a TTY.
 make test
 ```
 
-Use an environment with `click` and `pyyaml` installed. The 30 regression tests cover lifecycle failures, cleanup guards, binary secrets, mode ordering, updater replacement and SSH exit status. Live Compose/Swarm lifecycle verification remains outstanding; see the spec.
+Use an environment with `click` and `pyyaml` installed. The 31 regression tests cover lifecycle failures, cleanup guards, binary secrets, mode ordering, updater replacement and SSH exit status. Live Compose/Swarm lifecycle verification remains outstanding; see the spec.
 
 ---
 

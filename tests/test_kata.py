@@ -283,5 +283,27 @@ class ParserAuditTests(unittest.TestCase):
         self.assertNotIn('static', service)
 
 
+class ExampleConfigurationTests(unittest.TestCase):
+    def test_all_examples_parse_without_runtime_extensions_in_output(self):
+        from tempfile import TemporaryDirectory
+        from contextlib import ExitStack
+        examples = sorted((REPO / 'docs/examples').glob('*/kata-compose.yaml'))
+        self.assertEqual(len(examples), 8)
+        with TemporaryDirectory() as root, ExitStack() as patches:
+            for name in kata.ROOT_FOLDERS:
+                patches.enter_context(patch.object(kata, name, str(Path(root) / name)))
+            patches.enter_context(patch.object(kata, 'docker_handle_runtime_environment'))
+            patches.enter_context(patch.object(kata, 'traefik_is_running', return_value=True))
+            patches.enter_context(patch.object(kata, 'echo'))
+            for path in examples:
+                with self.subTest(example=path.parent.name):
+                    data, _ = kata.parse_compose(path.parent.name, str(path))
+                    self.assertTrue(data['services'])
+                    for service in data['services'].values():
+                        self.assertNotIn('runtime', service)
+                        self.assertNotIn('static', service)
+                    self.assertTrue(kata.safe_dump(data))
+
+
 if __name__ == "__main__":
     unittest.main()

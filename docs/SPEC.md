@@ -306,7 +306,7 @@ validation does not authenticate the downloaded script: upstream is trusted.
 
 ### Verification and remaining limits
 
-On 2026-09-05, 30 mocked regression tests passed. An isolated Alpine container with
+On 2026-09-05, 31 mocked regression tests passed. An isolated Alpine container with
 Compose-compatible labels verified local discovery, non-interactive exec and
 failure exit status against Docker 29.1.3, and was removed afterward. The test host
 has no Compose plugin and Swarm is inactive; live Compose/Swarm lifecycle tests and
